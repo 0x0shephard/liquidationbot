@@ -1,7 +1,8 @@
 import { formatEther } from 'viem';
 import { config, validateConfig } from './config';
 import { initializeTracker, trackSpecificAccount, getAllTrackedPositions, getTrackerStats } from './tracker';
-import { startMonitoring, stopMonitoring, logMarketStatus } from './monitor';
+import { startMonitoring, stopMonitoring, logMarketStatus, markReady } from './monitor';
+import { startHealthServer } from './health';
 import { sendTestEmail } from './notifications';
 import {
   getCurrentBlockNumber,
@@ -81,6 +82,10 @@ async function main(trackTarget?: { account: `0x${string}`; marketId: `0x${strin
   console.log(`Poll interval: ${config.pollingIntervalMs}ms`);
   console.log('='.repeat(60));
 
+  // Start this before the (slow) backfill so the platform can see the process is
+  // alive and merely not ready yet, rather than assuming it hung.
+  startHealthServer();
+
   validateConfig();
   await preflight();
 
@@ -104,6 +109,7 @@ async function main(trackTarget?: { account: `0x${string}`; marketId: `0x${strin
   const markets = [...new Set(getAllTrackedPositions().map((p) => p.marketId))];
   await logMarketStatus(markets);
 
+  markReady(await getCurrentBlockNumber());
   startMonitoring();
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {

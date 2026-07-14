@@ -71,10 +71,11 @@ export async function initializeTracker(): Promise<void> {
   console.log(`Backfill complete: ${count} log(s), ${trackedPositions.size} open position(s)`);
 }
 
-export async function syncNewEvents(): Promise<void> {
+export async function syncNewEvents(): Promise<bigint> {
   const currentBlock = await getCurrentBlockNumber();
-  if (currentBlock <= lastSyncedBlock) return;
+  if (currentBlock <= lastSyncedBlock) return lastSyncedBlock;
   await syncRange(lastSyncedBlock + 1n, currentBlock);
+  return lastSyncedBlock;
 }
 
 export function getAllTrackedPositions(): TrackedPosition[] {

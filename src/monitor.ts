@@ -21,6 +21,23 @@ import { HealthStatus, AlertData } from './types';
 // Funding is poked per-market, since each market has its own vAMM.
 const lastFundingPokeByMarket = new Map<string, number>();
 
+// Surfaced over the health endpoint so a stalled loop is externally visible.
+const state = {
+  ready: false,
+  lastCycleAt: null as number | null,
+  lastSyncedBlock: null as bigint | null,
+  lastError: null as string | null,
+};
+
+export function getMonitorState() {
+  return { ...state };
+}
+
+export function markReady(lastSyncedBlock: bigint): void {
+  state.ready = true;
+  state.lastSyncedBlock = lastSyncedBlock;
+}
+
 async function maybePokeFunding(marketIds: Set<string>): Promise<void> {
   const now = Date.now();
 
@@ -36,7 +53,7 @@ async function maybePokeFunding(marketIds: Set<string>): Promise<void> {
 }
 
 export async function monitorPositions(): Promise<void> {
-  await syncNewEvents();
+  state.lastSyncedBlock = await syncNewEvents();
 
   const positions = getAllTrackedPositions();
   const stats = getTrackerStats();
@@ -46,6 +63,7 @@ export async function monitorPositions(): Promise<void> {
 
   if (positions.length === 0) {
     console.log('No open positions');
+    state.lastCycleAt = Date.now();
     return;
   }
 
@@ -132,6 +150,8 @@ export async function monitorPositions(): Promise<void> {
   }
 
   if (config.executeMode) logExecutionStats();
+
+  state.lastCycleAt = Date.now();
 }
 
 let monitoringInterval: NodeJS.Timeout | null = null;
@@ -143,10 +163,21 @@ export function startMonitoring(): void {
   }
 
   console.log(`Starting monitor loop (every ${config.pollingIntervalMs}ms)`);
-  monitorPositions().catch(console.error);
-  monitoringInterval = setInterval(() => {
-    monitorPositions().catch(console.error);
-  }, config.pollingIntervalMs);
+
+  // A cycle failure must not kill the loop - a transient RPC blip would
+  // otherwise take the bot down until Railway restarts it.
+  const runCycle = () =>
+    monitorPositions()
+      .then(() => {
+        state.lastError = null;
+      })
+      .catch((error: any) => {
+        state.lastError = error.shortMessage || error.message || String(error);
+        console.error(`Cycle error: ${state.lastError}`);
+      });
+
+  runCycle();
+  monitoringInterval = setInterval(runCycle, config.pollingIntervalMs);
 }
 
 export function stopMonitoring(): void {
@@ -163,22 +194,27 @@ export async function logMarketStatus(marketIds: `0x${string}`[]): Promise<void>
 
   console.log('\n--- Market status ---');
   for (const marketId of marketIds) {
+    const label = `${marketId.slice(0, 10)}...`;
     try {
       const market = await getMarket(marketId);
-      const [oraclePrice, markPrice] = await Promise.all([
-        getOraclePrice(market.oracle),
-        getMarkPrice(market.vamm),
-      ]);
-
-      const oracleNum = Number(oraclePrice) / 1e18;
+      const markPrice = await getMarkPrice(market.vamm);
       const markNum = Number(markPrice) / 1e18;
-      const premium = oracleNum > 0 ? ((markNum - oracleNum) / oracleNum) * 100 : 0;
 
+      let oracleNum: number;
+      try {
+        oracleNum = Number(await getOraclePrice(market.oracle)) / 1e18;
+      } catch (error: any) {
+        if (!isStaleOracleError(error)) throw error;
+        console.log(`${label}  oracle STALE          mark $${markNum.toFixed(4)}  (not liquidatable until refreshed)`);
+        continue;
+      }
+
+      const premium = oracleNum > 0 ? ((markNum - oracleNum) / oracleNum) * 100 : 0;
       console.log(
-        `${marketId.slice(0, 10)}...  oracle $${oracleNum.toFixed(4)}  mark $${markNum.toFixed(4)}  premium ${premium.toFixed(3)}%${market.paused ? '  [PAUSED]' : ''}`
+        `${label}  oracle $${oracleNum.toFixed(4)}  mark $${markNum.toFixed(4)}  premium ${premium.toFixed(3)}%${market.paused ? '  [PAUSED]' : ''}`
       );
     } catch (error: any) {
-      console.error(`${marketId.slice(0, 10)}...  error: ${error.shortMessage || error.message}`);
+      console.error(`${label}  error: ${error.shortMessage || error.message}`);
     }
   }
   console.log('---------------------\n');
