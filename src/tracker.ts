@@ -1,154 +1,135 @@
 import { TrackedPosition, HealthStatus } from './types';
-import { getPosition, calculateMarginHealth, getPositionOpenedEvents, getPositionClosedEvents, getCurrentBlockNumber } from './blockchain';
+import {
+  getTradeLogs,
+  getCurrentBlockNumber,
+  getPosition,
+  calculateMarginHealth,
+  type TradeExecutedLog,
+} from './blockchain';
 import { config } from './config';
 
-// In-memory position tracker
-// In production, consider using Redis or a database
-const trackedPositions: Map<string, TrackedPosition> = new Map();
-let lastProcessedBlock: bigint = 0n;
+// In-memory index. A restart replays from START_BLOCK; for production, persist
+// (account, marketId, lastSyncedBlock) so restarts are cheap.
+const trackedPositions = new Map<string, TrackedPosition>();
+let lastSyncedBlock: bigint = config.startBlock - 1n;
 
-function getPositionKey(account: `0x${string}`, marketId: `0x${string}`): string {
-  return `${account.toLowerCase()}-${marketId.toLowerCase()}`;
+function positionKey(account: string, marketId: string): string {
+  return `${account.toLowerCase()}:${marketId.toLowerCase()}`;
 }
 
-export async function addPosition(account: `0x${string}`, marketId: `0x${string}`): Promise<TrackedPosition | null> {
-  const key = getPositionKey(account, marketId);
+/**
+ * TradeExecuted carries the post-trade newSize, so a single handler covers
+ * opens, resizes, closes and liquidations: newSize == 0 means flat.
+ */
+function applyTradeLog(log: TradeExecutedLog): void {
+  const marketId = log.args.marketId!.toLowerCase() as `0x${string}`;
+  if (config.marketIds.size > 0 && !config.marketIds.has(marketId)) return;
 
-  // Get current position data
-  const position = await getPosition(account, marketId);
+  const account = log.args.user!.toLowerCase() as `0x${string}`;
+  const key = positionKey(account, marketId);
+  const newSize = log.args.newSize!;
 
-  // Skip if no position
-  if (position.size === 0n) {
+  if (newSize === 0n) {
     trackedPositions.delete(key);
-    return null;
+    return;
   }
 
-  const health = await calculateMarginHealth(account, marketId);
-
-  const tracked: TrackedPosition = {
+  const existing = trackedPositions.get(key);
+  trackedPositions.set(key, {
     account,
     marketId,
-    position,
-    lastChecked: Date.now(),
-    healthStatus: health.status,
-  };
-
-  trackedPositions.set(key, tracked);
-  console.log(`Tracking position for ${account} in market ${marketId.slice(0, 10)}...`);
-
-  return tracked;
+    size: newSize,
+    updatedBlock: log.blockNumber!,
+    lastChecked: existing?.lastChecked ?? 0,
+    healthStatus: existing?.healthStatus ?? HealthStatus.SAFE,
+  });
 }
 
-export function removePosition(account: `0x${string}`, marketId: `0x${string}`): void {
-  const key = getPositionKey(account, marketId);
-  trackedPositions.delete(key);
-  console.log(`Stopped tracking position for ${account}`);
+async function syncRange(fromBlock: bigint, toBlock: bigint): Promise<number> {
+  if (toBlock < fromBlock) return 0;
+
+  let total = 0;
+  for (let start = fromBlock; start <= toBlock; start += config.logChunkSize) {
+    const end = start + config.logChunkSize - 1n > toBlock ? toBlock : start + config.logChunkSize - 1n;
+    const logs = await getTradeLogs(start, end);
+    for (const log of logs) applyTradeLog(log);
+    total += logs.length;
+    if (logs.length > 0) {
+      console.log(`Indexed TradeExecuted ${start}-${end}: ${logs.length} log(s)`);
+    }
+  }
+
+  lastSyncedBlock = toBlock;
+  return total;
+}
+
+export async function initializeTracker(): Promise<void> {
+  const currentBlock = await getCurrentBlockNumber();
+  console.log(`Backfilling TradeExecuted from block ${config.startBlock} to ${currentBlock}...`);
+
+  const count = await syncRange(config.startBlock, currentBlock);
+  console.log(`Backfill complete: ${count} log(s), ${trackedPositions.size} open position(s)`);
+}
+
+export async function syncNewEvents(): Promise<void> {
+  const currentBlock = await getCurrentBlockNumber();
+  if (currentBlock <= lastSyncedBlock) return;
+  await syncRange(lastSyncedBlock + 1n, currentBlock);
 }
 
 export function getAllTrackedPositions(): TrackedPosition[] {
   return Array.from(trackedPositions.values());
 }
 
-export function getTrackedPosition(account: `0x${string}`, marketId: `0x${string}`): TrackedPosition | undefined {
-  const key = getPositionKey(account, marketId);
-  return trackedPositions.get(key);
-}
-
-export function updateTrackedPosition(account: `0x${string}`, marketId: `0x${string}`, updates: Partial<TrackedPosition>): void {
-  const key = getPositionKey(account, marketId);
+export function updateTrackedPosition(
+  account: `0x${string}`,
+  marketId: `0x${string}`,
+  updates: Partial<TrackedPosition>
+): void {
+  const key = positionKey(account, marketId);
   const existing = trackedPositions.get(key);
-
-  if (existing) {
-    trackedPositions.set(key, { ...existing, ...updates });
-  }
+  if (existing) trackedPositions.set(key, { ...existing, ...updates });
 }
 
-// Initialize tracker by scanning historical events
-export async function initializeTracker(lookbackBlocks: number = 10000): Promise<void> {
-  console.log('Initializing position tracker...');
-
-  const currentBlock = await getCurrentBlockNumber();
-  const fromBlock = currentBlock - BigInt(lookbackBlocks);
-
-  console.log(`Scanning blocks ${fromBlock} to ${currentBlock} for position events...`);
-
-  // Get all position opened events
-  const openedEvents = await getPositionOpenedEvents(fromBlock, currentBlock);
-  console.log(`Found ${openedEvents.length} PositionOpened events`);
-
-  // Track unique accounts
-  const uniquePositions = new Map<string, { account: `0x${string}`; marketId: `0x${string}` }>();
-
-  for (const event of openedEvents) {
-    const key = getPositionKey(event.account, event.marketId);
-    uniquePositions.set(key, event);
-  }
-
-  // Check closed events to see if positions are still open
-  const closedEvents = await getPositionClosedEvents(fromBlock, currentBlock);
-  console.log(`Found ${closedEvents.length} PositionClosed events`);
-
-  for (const event of closedEvents) {
-    if (event.remainingSize === 0n) {
-      const key = getPositionKey(event.account, event.marketId);
-      uniquePositions.delete(key);
-    }
-  }
-
-  // Add remaining open positions
-  console.log(`Tracking ${uniquePositions.size} active positions`);
-
-  for (const { account, marketId } of uniquePositions.values()) {
-    await addPosition(account, marketId);
-  }
-
-  lastProcessedBlock = currentBlock;
-  console.log('Tracker initialization complete');
+export function removePosition(account: `0x${string}`, marketId: `0x${string}`): void {
+  trackedPositions.delete(positionKey(account, marketId));
 }
 
-// Update tracker with new events
-export async function syncNewEvents(): Promise<void> {
-  const currentBlock = await getCurrentBlockNumber();
-
-  if (currentBlock <= lastProcessedBlock) {
+/** Track an account explicitly, bypassing event discovery (--track). */
+export async function trackSpecificAccount(
+  account: `0x${string}`,
+  marketId: `0x${string}`
+): Promise<void> {
+  const position = await getPosition(account, marketId);
+  if (position.size === 0n) {
+    console.log(`${account} has no open position in ${marketId}`);
     return;
   }
 
-  const fromBlock = lastProcessedBlock + 1n;
+  const health = await calculateMarginHealth(account, marketId, position);
+  trackedPositions.set(positionKey(account, marketId), {
+    account,
+    marketId,
+    size: position.size,
+    updatedBlock: 0n,
+    lastChecked: Date.now(),
+    healthStatus: health.status,
+  });
 
-  // Get new opened positions
-  const openedEvents = await getPositionOpenedEvents(fromBlock, currentBlock);
-  for (const event of openedEvents) {
-    await addPosition(event.account, event.marketId);
-  }
-
-  // Check for closed positions
-  const closedEvents = await getPositionClosedEvents(fromBlock, currentBlock);
-  for (const event of closedEvents) {
-    if (event.remainingSize === 0n) {
-      removePosition(event.account, event.marketId);
-    } else {
-      // Position still open but reduced, update it
-      await addPosition(event.account, event.marketId);
-    }
-  }
-
-  lastProcessedBlock = currentBlock;
+  console.log(`Tracking ${account} in ${marketId} (size ${position.size}, ${health.status})`);
 }
 
-// Manual position tracking (for specific accounts)
-export async function trackSpecificAccount(account: `0x${string}`): Promise<void> {
-  console.log(`Manually tracking account ${account} for market ${config.marketId.slice(0, 10)}...`);
-  await addPosition(account, config.marketId);
-}
-
-export function getTrackerStats(): { total: number; safe: number; warning: number; liquidatable: number } {
+export function getTrackerStats(): {
+  total: number;
+  safe: number;
+  warning: number;
+  liquidatable: number;
+} {
   const positions = getAllTrackedPositions();
-
   return {
     total: positions.length,
-    safe: positions.filter(p => p.healthStatus === HealthStatus.SAFE).length,
-    warning: positions.filter(p => p.healthStatus === HealthStatus.WARNING).length,
-    liquidatable: positions.filter(p => p.healthStatus === HealthStatus.LIQUIDATABLE).length,
+    safe: positions.filter((p) => p.healthStatus === HealthStatus.SAFE).length,
+    warning: positions.filter((p) => p.healthStatus === HealthStatus.WARNING).length,
+    liquidatable: positions.filter((p) => p.healthStatus === HealthStatus.LIQUIDATABLE).length,
   };
 }

@@ -1,364 +1,149 @@
 # ByteStrike Liquidation Bot
 
-A Node.js/TypeScript bot that monitors the ByteStrike perpetual futures protocol for positions at risk of liquidation. Supports both **monitoring mode** (alerts only) and **execution mode** (automatic liquidations).
+A TypeScript bot that monitors the ByteStrike perpetuals protocol on **Sepolia** for
+undercollateralized positions, alerts on them, and optionally liquidates them.
 
-## Features
+Targets the contracts in `bytestrikecontracts/` and the live Sepolia deployment
+recorded in `deployments/sepolia-addresses.md`.
 
-### Monitoring Features
-- **Position Monitoring**: Tracks all open positions in the protocol via event indexing
-- **Health Status Detection**: Categorizes positions into SAFE, WARNING, or LIQUIDATABLE
-- **Email Alerts**: Sends notifications via SendGrid when positions enter warning/liquidation zones
-- **Rate Limiting**: Prevents alert spam with 5-minute cooldown per account
-- **Real-time Sync**: Automatically discovers new positions from blockchain events
-- **Market Status**: Displays current mark price, oracle price, and funding premium
+## Contracts
 
-### Execution Features (NEW!)
-- **Automatic Liquidations**: Execute liquidations when profitable
-- **Profitability Checks**: Only liquidates when expected reward exceeds gas costs + minimum threshold
-- **Gas Price Protection**: Skip transactions when gas prices are too high
-- **Funding Rate Pokes**: Periodically update funding rates (configurable interval)
-- **Dry Run Mode**: Simulate executions without sending transactions
-- **Execution Statistics**: Track total liquidations, rewards, and gas costs
-- **Transaction Simulation**: All transactions are simulated before execution to prevent failures
+| Component | Address |
+| --- | --- |
+| ClearingHouse (proxy) | `0xDf4DDD4019097B335dD507f916984A1A53E40a0d` |
+| MarketRegistry | `0x236b75D39203506ee3180Ef2E1c7460a188C43c6` |
 
-## Alert Zones
+Per-market **vAMM, oracle and FeeRouter addresses are resolved from the
+MarketRegistry at runtime** — they are never hardcoded. The bot is multi-market by
+default; set `MARKET_IDS` to restrict it.
 
-The bot monitors the margin health of each position:
+## How it works
 
-- **SAFE** (Green): `Effective Margin >= Initial Margin Requirement (IMR)`
-  - Position is healthy with sufficient collateral
+**Position discovery.** The ClearingHouse has no way to enumerate positions, so the
+bot indexes `TradeExecuted` logs. That event carries the post-trade `newSize`, which
+means opens, resizes, closes *and* liquidations all collapse into one signal:
+`newSize == 0` means the account is flat. (`PositionOpened`/`PositionClosed` exist in
+older versions of the protocol but not in the deployed one.)
 
-- **WARNING** (Yellow): `MMR <= Effective Margin < IMR`
-  - Position is below IMR but still above liquidation threshold
-  - User should consider adding margin or reducing position
+**Health classification.** `isLiquidatable()` on-chain is the sole authority for
+`LIQUIDATABLE`. It folds in pending funding and real-time collateral valuation
+(quote-token depeg), which cannot be faithfully reproduced off-chain. The bot's own
+IMR comparison is used only to raise an early `WARNING`, and is deliberately
+approximate.
 
-- **LIQUIDATABLE** (Red): `Effective Margin < Maintenance Margin (MMR)`
-  - Position can be liquidated immediately
-  - Urgent action required
+**Liquidation.** `liquidate(account, marketId, size, amountLimit)`:
+
+1. Re-read the position from chain — the tracker's size is a cache, and the contract
+   requires `0 < size <= currentSize`.
+2. Re-check `isLiquidatable` and `isActive`.
+3. Simulate. This catches reverts early *and* yields the gas estimate.
+4. Price it: `reward - gasCost > MIN_LIQUIDATION_REWARD_USD`.
+5. Send, wait for the receipt, record the result.
+
+**Reward model** — mirrors the contract exactly, reading every input from chain:
+
+```
+notional = size * oraclePrice / 1e18          (pre-trade risk price, rounded up)
+penalty  = min(notional * liquidationPenaltyBps / 10000, penaltyCap)
+reward   = feeRouter set ? penalty / 2 : penalty
+```
+
+On the current Sepolia markets that is **250 bps, a `1000e18` cap, and a FeeRouter on
+every market** — so the liquidator's reward is capped at roughly **500 quote units per
+liquidation**, no matter how large the position. Assuming an uncapped percentage of
+notional (as an earlier version did) overstates the reward on big positions.
 
 ## Setup
 
-### 1. Install Dependencies
-
 ```bash
-cd liquidation-bot
 npm install
+cp .env.example .env   # then edit
+npm run build
+npm start
 ```
 
-### 2. Configure Environment
+### An archive RPC is required
 
-Copy the example environment file and fill in your values:
+Bootstrap replays `TradeExecuted` from the deployment block (10,797,215). Public
+endpoints reject historical `eth_getLogs` with *"Archive requests require a personal
+token"*. Use Alchemy/Infura, or raise `START_BLOCK` if you don't need older positions.
 
-```bash
-cp .env.example .env
-```
+### Execution mode
 
-Edit `.env` with your configuration:
-
-```env
-# RPC Configuration
-RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
-
-# Execution Mode Configuration
-PRIVATE_KEY=0xYourPrivateKeyHere  # REQUIRED for execution mode
-EXECUTE_MODE=false  # Set to 'true' to enable liquidation execution
-DRY_RUN=false       # Set to 'true' to simulate without sending txs
-
-# Execution Parameters
-MIN_LIQUIDATION_REWARD_USD=10  # Minimum profit to execute (USD)
-MAX_GAS_PRICE_GWEI=50          # Skip if gas price exceeds this
-FUNDING_POKE_INTERVAL_MS=3600000  # 1 hour
-
-# SendGrid Configuration (optional for email alerts)
-SENDGRID_API_KEY=your_sendgrid_api_key
-SENDGRID_FROM_EMAIL=alerts@yourdomain.com
-ALERT_RECIPIENT_EMAIL=user@example.com
-
-# Bot Configuration
-POLLING_INTERVAL_MS=30000  # Check every 30 seconds
-```
-
-### Important: Execution Mode Setup
-
-If you want to execute liquidations (not just monitor), follow these additional steps:
-
-#### 1. Generate a Private Key
-
-```bash
-# Using Foundry's cast tool
-cast wallet new
-
-# Or use any wallet tool to generate a new address
-```
-
-⚠️ **Security Warning**:
-- Never use your main wallet's private key
-- Create a dedicated liquidator wallet
-- Only fund it with enough ETH for gas (testnet ETH on Sepolia)
-- Never commit your `.env` file to git
-
-#### 2. Whitelist Your Liquidator Address
-
-Your liquidator address must be whitelisted in the ClearingHouse contract. Contact the protocol admin to whitelist your address:
+Liquidating requires a whitelisted address — `liquidate` is behind
+`onlyWhitelistedLiquidator`. An admin must call:
 
 ```solidity
-// Admin must call:
-clearingHouse.setLiquidatorWhitelist(yourLiquidatorAddress, true);
+clearingHouse.setWhitelistedLiquidator(yourAddress, true);
 ```
 
-Without whitelisting, liquidation transactions will fail with "Caller is not a whitelisted liquidator".
+The bot verifies this at startup and **refuses to start** in execute mode without it,
+rather than discovering it one revert at a time. Then:
 
-#### 3. Fund Your Liquidator Wallet
-
-On Sepolia testnet:
-- Get test ETH from [Sepolia faucet](https://sepoliafaucet.com/)
-- You need ETH for gas fees (transactions cost ~0.001-0.01 ETH)
-- Start with 0.1 ETH to be safe
-
-#### 4. Enable Execution Mode
-
-In your `.env`:
 ```env
 EXECUTE_MODE=true
+PRIVATE_KEY=0x...
 ```
 
-### 3. Get SendGrid API Key
+Use a dedicated wallet funded only with gas. Never reuse a main wallet key.
 
-1. Sign up at [SendGrid](https://sendgrid.com/)
-2. Create an API key with "Mail Send" permissions
-3. Verify your sender email domain
-4. Add the API key to your `.env` file
+### Dry run
 
-### 4. Get Alchemy/Infura RPC URL
+`DRY_RUN=true` runs every check, the simulation and the profitability calculation, but
+never sends. It reports skips honestly — it does not count simulated liquidations as
+successes.
 
-1. Sign up at [Alchemy](https://www.alchemy.com/) or [Infura](https://infura.io/)
-2. Create a new app for Sepolia testnet
-3. Copy the HTTPS endpoint to your `.env` file
+## Modes
 
-## Usage
+| | Reads | Alerts | Simulates | Sends txs |
+| --- | --- | --- | --- | --- |
+| Monitoring (default) | ✅ | ✅ | — | — |
+| `DRY_RUN=true` | ✅ | ✅ | ✅ | — |
+| `EXECUTE_MODE=true` | ✅ | ✅ | ✅ | ✅ |
 
-### Monitoring Mode (Default - Safe)
-
-Monitor positions and send alerts without executing transactions:
+## Commands
 
 ```bash
-# Development
-npm run dev
-
-# Production
-npm run build
-npm run start
-```
-
-### Execution Mode (Automatic Liquidations)
-
-Execute liquidations automatically when profitable:
-
-```bash
-# 1. Set EXECUTE_MODE=true in .env
-# 2. Ensure PRIVATE_KEY is set and whitelisted
-# 3. Run the bot
-npm run build
-npm run start
-```
-
-The bot will display:
-```
-⚡ EXECUTION MODE ENABLED - Bot will execute liquidations
-```
-
-### Dry Run Mode (Testing)
-
-Test execution logic without sending transactions:
-
-```bash
-# Set in .env:
-# EXECUTE_MODE=true
-# DRY_RUN=true
-
-npm run dev
-```
-
-Output will show simulated liquidations with:
-```
-🔍 DRY RUN MODE - Skipping actual execution
-```
-
-### Other Commands
-
-#### Test Email Configuration
-```bash
-npm run dev -- --test-email
-```
-
-#### Track Specific Account
-```bash
-npm run dev -- --track 0xYourAddress
-```
-
-#### Help
-```bash
+npm run dev                              # development
+npm start                                # from build
 npm run dev -- --help
+npm run dev -- --test-email
+npm run dev -- --track <account> <marketId>
 ```
 
-## How It Works
+## Operational notes
 
-### Monitoring Mode
+**Stale oracles.** The CuOracle adapters revert with `CuOracleAdapter_PriceStale()`
+when a feed hasn't been refreshed inside its staleness window. On Sepolia this is
+common — at time of writing `B200-PERP-V2` is stale while other markets are fresh. The
+bot detects this, skips the affected market for that cycle with a single warning, and
+keeps going. Nothing can be liquidated in a market whose oracle is stale, because
+`isLiquidatable` reverts too. Refresh with the price scripts in `bytestrikecontracts/script/`.
 
-1. **Initialization**
-   - Connects to Sepolia testnet via RPC
-   - Validates configuration
-   - Scans historical events (last 50k blocks) to find all open positions
+**Gas pricing.** These are GPU compute perps. No market's mark price is a proxy for
+ETH, so `ETH_PRICE_USD` must be supplied to convert gas into USD.
 
-2. **Monitoring Loop** (every 30 seconds by default)
-   - Syncs new position events from blockchain
-   - Calculates margin health for each tracked position
-   - Sends alerts for positions in WARNING or LIQUIDATABLE zones
-   - Logs status changes to console
+**Front-running.** Other liquidators compete. The bot re-checks liquidatability and
+simulates immediately before sending, so a lost race is a clean skip rather than a
+failed transaction.
 
-3. **Margin Health Calculation**
-   ```
-   Notional Value = |Position Size| × Mark Price
-   Unrealized PnL = (Mark Price - Entry Price) × Position Size  // for longs
-   Effective Margin = Stored Margin + Unrealized PnL
+**Persistence.** The position index is in-memory; a restart replays from `START_BLOCK`.
+For production, persist `(account, marketId, lastSyncedBlock)`.
 
-   IMR = Notional Value × IMR_BPS / 10000  (10%)
-   MMR = Notional Value × MMR_BPS / 10000  (2.5%)
-   ```
-
-4. **Alert Triggers**
-   - Status changes (SAFE → WARNING, WARNING → LIQUIDATABLE)
-   - New LIQUIDATABLE status (always alert)
-   - Rate limited to prevent spam
-
-### Execution Mode (Additional Features)
-
-5. **Funding Rate Pokes** (every 1 hour by default)
-   - Calls `vAMM.pokeFunding()` to update funding rates
-   - Ensures accurate funding calculations for all traders
-   - Skipped if gas price exceeds maximum
-
-6. **Liquidation Execution** (when LIQUIDATABLE position found)
-   ```
-   Step 1: Calculate expected reward
-     - Penalty = Notional × 2% (liquidationPenaltyBps)
-     - Liquidator Reward = Penalty × 50%
-     - Expected Reward (USD) = Reward in quote tokens
-
-   Step 2: Estimate gas costs
-     - Simulate transaction to estimate gas units
-     - Gas Cost (USD) = Gas Units × Gas Price × ETH Price
-
-   Step 3: Profitability check
-     - Net Profit = Expected Reward - Gas Cost
-     - Execute only if Net Profit > MIN_LIQUIDATION_REWARD_USD
-     - Skip if gas price > MAX_GAS_PRICE_GWEI
-
-   Step 4: Execute liquidation
-     - Simulate transaction first (catch errors early)
-     - Send transaction via wallet client
-     - Wait for confirmation
-     - Log results and update statistics
-   ```
-
-7. **Execution Statistics**
-   - Tracks total liquidations attempted/successful/failed
-   - Calculates cumulative rewards and gas costs
-   - Displays net profit
-   - Logs to console after each monitoring cycle
-
-## Project Structure
+## Layout
 
 ```
-liquidation-bot/
-├── src/
-│   ├── index.ts           # Main entry point and CLI
-│   ├── config.ts          # Configuration management
-│   ├── types.ts           # TypeScript type definitions
-│   ├── abis.ts            # Contract ABIs (read + write functions)
-│   ├── blockchain.ts      # Blockchain interaction (read + execute)
-│   ├── tracker.ts         # Position tracking via events
-│   ├── monitor.ts         # Main monitoring + execution logic
-│   ├── executor.ts        # Liquidation execution with profitability checks
-│   └── notifications.ts   # Email alerting via SendGrid
-├── .env.example           # Environment template
-├── package.json           # Dependencies
-├── tsconfig.json          # TypeScript config
-└── README.md              # This file
+src/
+├── index.ts          # entry point, CLI, startup preflight (whitelist check)
+├── config.ts         # env + live Sepolia defaults
+├── abis.ts           # ABIs, matching bytestrikecontracts
+├── blockchain.ts     # chain reads/writes, RPC retry, margin health
+├── tracker.ts        # position index via TradeExecuted
+├── monitor.ts        # polling loop
+├── executor.ts       # profitability + liquidation execution
+├── notifications.ts  # SendGrid alerts
+└── types.ts
 ```
-
-## Deployed Contract Addresses (Sepolia)
-
-- **ClearingHouse**: `0x445Fa8890562Ec6220A60b3911C692DffaD49AcB`
-- **vAMM (Active)**: `0x3f9b634b9f09e7F8e84348122c86d3C2324841b5`
-- **Oracle**: `0x3cA2Da03e4b6dB8fe5a24c22Cf5EB2A34B59cbad`
-- **Market ID (ETH-PERP-V2)**: `0x385badc...087a28`
-
-## Configuration Parameters
-
-### Execution Settings
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `EXECUTE_MODE` | `false` | Enable automatic liquidation execution |
-| `DRY_RUN` | `false` | Simulate transactions without sending |
-| `PRIVATE_KEY` | - | Private key for liquidator wallet (required for execution) |
-
-### Profitability Controls
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `MIN_LIQUIDATION_REWARD_USD` | `10` | Minimum net profit to execute liquidation |
-| `MAX_GAS_PRICE_GWEI` | `50` | Maximum gas price (skip if exceeded) |
-| `FUNDING_POKE_INTERVAL_MS` | `3600000` | How often to poke funding (1 hour) |
-
-### Bot Settings
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `POLLING_INTERVAL_MS` | `30000` | Monitoring cycle interval (30 seconds) |
-| `WARNING_THRESHOLD_BUFFER` | `0.1` | Buffer for warning threshold |
-
-## Future Enhancements
-
-- [ ] Database persistence for position tracking (Redis/PostgreSQL)
-- [ ] Discord/Telegram notification support
-- [ ] Web dashboard for monitoring
-- [ ] Multi-market support
-- [x] ✅ **Liquidation execution** (COMPLETED!)
-- [x] ✅ **Funding rate pokes** (COMPLETED!)
-- [ ] Historical analytics and reporting
-- [ ] WebSocket support for faster updates
-- [ ] MEV protection and flashbots integration
-- [ ] Multi-signature wallet support for added security
-
-## Important Notes
-
-### For Monitoring Mode
-
-1. **No Position Enumeration**: The smart contracts don't provide a way to list all positions. The bot tracks positions by monitoring `PositionOpened` and `PositionClosed` events.
-
-2. **Rate Limiting**: Email alerts have a 5-minute cooldown per account to prevent spam during volatile markets.
-
-3. **No Gas Costs**: Monitoring mode doesn't execute transactions or consume gas.
-
-### For Execution Mode
-
-1. **Whitelist Requirement**: Your liquidator address MUST be whitelisted by the protocol admin. Without whitelisting, all liquidation transactions will fail.
-
-2. **Profitability First**: The bot will only execute liquidations if the expected reward exceeds gas costs plus the minimum threshold. Unprofitable liquidations are skipped.
-
-3. **Gas Price Protection**: Transactions are skipped when gas prices are too high to prevent unprofitable executions during network congestion.
-
-4. **Front-Running Risk**: Other liquidators may execute liquidations before you. The bot handles this gracefully by simulating transactions first.
-
-5. **Private Key Security**:
-   - Never use your main wallet
-   - Never commit `.env` to git
-   - Use a dedicated liquidator wallet with only gas funds
-   - Consider using a hardware wallet in production
-
-6. **Testnet Only**: Currently configured for Sepolia testnet. Modify contract addresses and thoroughly test before mainnet deployment.
 
 ## License
 

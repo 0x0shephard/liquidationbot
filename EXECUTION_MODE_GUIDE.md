@@ -1,333 +1,236 @@
-# Liquidation Bot Execution Mode - Quick Start Guide
+# Execution Mode — Setup Guide
 
-## Overview
+How to take the bot from read-only monitoring to actually liquidating positions on
+the live Sepolia deployment.
 
-Your liquidation bot now supports **automatic liquidation execution** with built-in profitability checks, gas price protection, and periodic funding rate updates.
-
-## What's New
-
-### ✅ Features Added
-
-1. **Automatic Liquidations**
-   - Execute liquidations when positions become underwater
-   - Profitability checks before execution
-   - Gas price protection
-   - Transaction simulation before sending
-
-2. **Funding Rate Pokes**
-   - Periodically calls `vAMM.pokeFunding()` (default: every 1 hour)
-   - Ensures accurate funding calculations for all traders
-   - Gas-optimized (only when needed)
-
-3. **Execution Statistics**
-   - Track total liquidations executed
-   - Monitor total rewards vs gas costs
-   - Calculate net profit in real-time
-
-4. **Safety Features**
-   - Dry run mode for testing
-   - Minimum profitability threshold
-   - Maximum gas price limit
-   - Transaction simulation before execution
-   - Graceful error handling
-
-## Quick Setup (5 Minutes)
-
-### Step 1: Generate Liquidator Wallet
-
-```bash
-# Using Foundry's cast tool
-cast wallet new
-
-# Output:
-# Successfully created new keypair.
-# Address:     0x1234567890123456789012345678901234567890
-# Private key: 0xabcdef...
-```
-
-**⚠️ IMPORTANT**: Save this private key securely! Never share it or commit it to git.
-
-### Step 2: Get Test ETH (Sepolia)
-
-Visit https://sepoliafaucet.com/ and request test ETH for your new address.
-
-You'll need about **0.1 ETH** for gas fees.
-
-### Step 3: Whitelist Your Address
-
-Contact the ByteStrike protocol admin to whitelist your liquidator address:
-
-```solidity
-// Admin needs to call:
-clearingHouse.setLiquidatorWhitelist(0x1234567890123456789012345678901234567890, true);
-```
-
-**Verification**: You can check if you're whitelisted by calling:
-```bash
-cast call 0x445Fa8890562Ec6220A60b3911C692DffaD49AcB \
-  "WhitelistedLiquidators(address)(bool)" \
-  0xYourAddress \
-  --rpc-url $SEPOLIA_RPC_URL
-```
-
-### Step 4: Configure .env
-
-```bash
-cd liquidation-bot
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```env
-# ============ REQUIRED FOR EXECUTION ============
-RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
-PRIVATE_KEY=0xYourPrivateKeyFromStep1
-EXECUTE_MODE=true
-
-# ============ OPTIONAL TUNING ============
-# Start with dry run to test
-DRY_RUN=false
-
-# Profitability settings
-MIN_LIQUIDATION_REWARD_USD=10  # Skip if profit < $10
-MAX_GAS_PRICE_GWEI=50          # Skip if gas > 50 gwei
-
-# Intervals
-POLLING_INTERVAL_MS=30000           # Check every 30 seconds
-FUNDING_POKE_INTERVAL_MS=3600000    # Poke funding every 1 hour
-```
-
-### Step 5: Test with Dry Run First
-
-Before executing real transactions, test with dry run mode:
-
-```bash
-# Set in .env:
-# EXECUTE_MODE=true
-# DRY_RUN=true
-
-npm run build
-npm run start
-```
-
-Look for:
-```
-⚡ EXECUTION MODE ENABLED - Bot will execute liquidations
-🔍 DRY RUN MODE - Transactions will be simulated but not sent
-```
-
-The bot will show what it would do without spending gas.
-
-### Step 6: Go Live!
-
-Once you're confident:
-
-```bash
-# Set in .env:
-# DRY_RUN=false
-
-npm run build
-npm run start
-```
-
-Look for:
-```
-⚡ EXECUTION MODE ENABLED - Bot will execute liquidations
-```
-
-## How It Works
-
-### Monitoring Loop (Every 30 seconds)
-
-1. **Sync Events**: Discover new positions from blockchain events
-2. **Check Funding**: Poke funding if 1 hour has elapsed
-3. **Calculate Health**: Check margin health for all positions
-4. **Find Liquidations**: Identify LIQUIDATABLE positions
-5. **Profitability Check**:
-   ```
-   Expected Reward = Position Notional × 2% × 50%
-   Gas Cost = Estimated Gas × Gas Price × ETH Price
-   Net Profit = Expected Reward - Gas Cost
-
-   Execute if: Net Profit > MIN_LIQUIDATION_REWARD_USD
-   ```
-6. **Execute**: Send liquidation transaction
-7. **Wait & Log**: Confirm transaction and update statistics
-
-### Profitability Example
-
-```
-Position: 10 ETH short
-Mark Price: $3.75
-Notional: 10 × $3.75 = $37.50
-
-Penalty: $37.50 × 2% = $0.75
-Liquidator Reward: $0.75 × 50% = $0.375
-
-Gas: 300,000 units × 20 gwei = 0.006 ETH
-Gas Cost: 0.006 × $3.75 = $0.0225
-
-Net Profit: $0.375 - $0.0225 = $0.35
-
-✅ Execute (profit > $0.10 minimum)
-```
-
-## Configuration Parameters
-
-### Essential Settings
-
-| Parameter | Recommended | Description |
-|-----------|-------------|-------------|
-| `EXECUTE_MODE` | `true` | Enable execution |
-| `DRY_RUN` | `false` | Start with `true` to test |
-| `PRIVATE_KEY` | Your key | From Step 1 |
-| `RPC_URL` | Alchemy/Infura | Your RPC endpoint |
-
-### Profitability Tuning
-
-| Parameter | Default | Adjust If... |
-|-----------|---------|--------------|
-| `MIN_LIQUIDATION_REWARD_USD` | `10` | Increase on mainnet (higher gas costs) |
-| `MAX_GAS_PRICE_GWEI` | `50` | Lower during high network usage |
-| `FUNDING_POKE_INTERVAL_MS` | `3600000` | Increase to save gas (less frequent) |
-
-### Performance Tuning
-
-| Parameter | Default | Adjust If... |
-|-----------|---------|--------------|
-| `POLLING_INTERVAL_MS` | `30000` | Decrease for faster detection (more RPC calls) |
-
-## Monitoring Your Bot
-
-### Console Output
-
-```
-[2025-01-XX] Monitoring 5 positions...
-Status: 3 safe, 1 warning, 1 liquidatable
-
-Mark Price: $3.75
-Oracle Price: $3.75
-
-🚨 LIQUIDATABLE position found: 0x1234567890...
-
-💰 Profitability check:
-   Expected reward: $15.50
-   Estimated gas cost: $0.25
-   Net profit: $15.25
-   Minimum required: $10
-   Profitable: ✅
-
-⚡ Executing liquidation transaction...
-📝 Transaction sent: 0xabcd...
-   View on Etherscan: https://sepolia.etherscan.io/tx/0xabcd...
-⏳ Waiting for confirmation...
-✅ Liquidation successful!
-   Block: 12345678
-   Gas used: 285432
-   Estimated reward: $15.50
-
-📊 Execution Statistics:
-   Total liquidations attempted: 1
-   Successful: 1
-   Failed: 0
-   Total rewards: $15.50
-   Total gas costs: $0.25
-   Net profit: $15.25
-```
-
-### Transaction Tracking
-
-All liquidations are logged on Etherscan:
-- Sepolia: https://sepolia.etherscan.io/address/YOUR_LIQUIDATOR_ADDRESS
-
-## Common Issues
-
-### ❌ "Caller is not a whitelisted liquidator"
-
-**Problem**: Your address isn't whitelisted in the ClearingHouse contract.
-
-**Solution**: Contact the protocol admin to whitelist your address (see Step 3).
-
-### ❌ "Not liquidatable"
-
-**Problem**: Position was liquidated by another bot (front-run).
-
-**Solution**: This is normal in competitive liquidation environments. The bot will skip and move on.
-
-### ❌ "Gas price too high"
-
-**Problem**: Current gas price exceeds `MAX_GAS_PRICE_GWEI`.
-
-**Solution**:
-- Wait for gas to decrease (bot will retry on next cycle)
-- Or increase `MAX_GAS_PRICE_GWEI` if acceptable
-
-### ❌ "Liquidation not profitable - skipping"
-
-**Problem**: Expected profit is less than `MIN_LIQUIDATION_REWARD_USD`.
-
-**Solution**:
-- Lower `MIN_LIQUIDATION_REWARD_USD` if you want to accept smaller profits
-- Or wait for larger positions to become liquidatable
-
-## Safety Checklist
-
-Before going live:
-
-- [ ] Tested with `DRY_RUN=true` first
-- [ ] Liquidator address is whitelisted
-- [ ] Wallet funded with test ETH (0.1 ETH minimum)
-- [ ] Private key is NOT in git (`.env` in `.gitignore`)
-- [ ] Using a dedicated liquidator wallet (not your main wallet)
-- [ ] RPC URL is working (test with `npm run dev -- --help`)
-- [ ] Email alerts configured (optional)
-- [ ] Understand profitability parameters
-
-## Advanced Usage
-
-### Multiple Bots (Competition)
-
-Run multiple bots with different strategies:
-
-```bash
-# Bot 1: Aggressive (lower profit threshold)
-MIN_LIQUIDATION_REWARD_USD=5
-MAX_GAS_PRICE_GWEI=100
-
-# Bot 2: Conservative (higher profit threshold)
-MIN_LIQUIDATION_REWARD_USD=20
-MAX_GAS_PRICE_GWEI=30
-```
-
-### Custom Funding Poke Schedule
-
-```bash
-# Poke every 30 minutes
-FUNDING_POKE_INTERVAL_MS=1800000
-
-# Poke every 2 hours
-FUNDING_POKE_INTERVAL_MS=7200000
-```
-
-## Support & Troubleshooting
-
-1. Check console logs for detailed error messages
-2. Review transaction on Etherscan for failure reasons
-3. Verify wallet has sufficient ETH balance
-4. Confirm whitelist status
-5. Test with `DRY_RUN=true` to debug logic
-
-## Next Steps
-
-Once running successfully on Sepolia:
-
-1. Monitor performance for 24 hours
-2. Tune profitability parameters based on actual results
-3. Set up monitoring dashboards (optional)
-4. Consider database persistence for production
-5. Plan for mainnet deployment (higher gas costs, real money!)
+Read the [README](./README.md) first for how the bot works. This guide is only the
+operational path to executing.
 
 ---
 
-**Remember**: Start small, test thoroughly, and never risk more than you can afford to lose!
+## Before you start
+
+Three things gate execution. Any one of them missing means zero liquidations:
+
+1. **An archive-capable RPC.** The bot backfills `TradeExecuted` logs from the deploy
+   block. Public endpoints (publicnode, etc.) reject historical `eth_getLogs` with
+   *"Archive requests require a personal token"*. You need Alchemy or Infura.
+2. **A whitelisted liquidator address.** `liquidate` is behind
+   `onlyWhitelistedLiquidator`. Without it, every attempt reverts.
+3. **A fresh oracle on the market you want to liquidate in.** Stale oracles make
+   `isLiquidatable` itself revert — see [Stale oracles](#stale-oracles).
+
+---
+
+## Step 1 — Generate a liquidator wallet
+
+The bot has **no address of its own**. Its identity is derived from the `PRIVATE_KEY`
+you give it, so until you set one there is nothing to whitelist.
+
+```bash
+cast wallet new
+```
+
+Use a **dedicated** wallet. Fund it with gas only — never reuse a wallet that holds
+anything you care about. The key goes in `.env` (already gitignored):
+
+```env
+PRIVATE_KEY=0xabc...
+```
+
+## Step 2 — Read the bot's address
+
+```bash
+npm run dev -- --address
+```
+
+```
+Liquidator address: 0x...
+Balance:            0.0 ETH
+Whitelisted:        NO
+
+An admin must run, on the ClearingHouse (0xDf4DDD4019097B335dD507f916984A1A53E40a0d):
+  setWhitelistedLiquidator(0x..., true)
+```
+
+That address is what gets whitelisted. Re-run this command any time to confirm the
+whitelist landed.
+
+## Step 3 — Whitelist it
+
+A protocol admin must call, on the **ClearingHouse proxy**
+`0xDf4DDD4019097B335dD507f916984A1A53E40a0d`:
+
+```solidity
+clearingHouse.setWhitelistedLiquidator(<botAddress>, true);
+```
+
+Or with `cast`, from the admin key:
+
+```bash
+cast send 0xDf4DDD4019097B335dD507f916984A1A53E40a0d \
+  "setWhitelistedLiquidator(address,bool)" <botAddress> true \
+  --rpc-url $RPC_URL --private-key $ADMIN_KEY
+```
+
+Note the name: it is `setWhitelistedLiquidator`, **not** `setLiquidatorWhitelist`.
+
+The bot verifies this at startup and refuses to run in execute mode without it, rather
+than discovering it one revert at a time.
+
+## Step 4 — Fund it with gas
+
+Get Sepolia ETH from a faucet. ~0.1 ETH is plenty. Gas is the only thing this wallet
+spends — rewards are paid in the quote token, not ETH.
+
+## Step 5 — Dry run
+
+Prove the whole path before spending anything:
+
+```env
+EXECUTE_MODE=true
+DRY_RUN=true
+```
+
+```bash
+npm run dev
+```
+
+Dry run does everything except send: it re-reads the position, re-checks
+liquidatability, **simulates the transaction**, and prices profitability. It reports
+skips honestly and does not count simulated liquidations as successes. If a
+liquidation would revert, you find out here.
+
+## Step 6 — Go live
+
+```env
+EXECUTE_MODE=true
+DRY_RUN=false
+```
+
+```bash
+npm run build && npm start
+```
+
+You should see:
+
+```
+⚡ EXECUTION MODE ENABLED - Bot will execute liquidations
+Liquidator: 0x...
+Whitelisted: true
+```
+
+---
+
+## What happens on each liquidation
+
+1. Re-read the position from chain. The tracker's size is a cache, and the contract
+   requires `0 < size <= currentSize` — a stale size reverts as `InvalidSize`.
+2. Re-check `isLiquidatable` and `isActive`. Another liquidator may have front-run
+   you, or the price may have recovered.
+3. Check gas price against `MAX_GAS_PRICE_GWEI`.
+4. **Simulate.** This catches reverts early and produces the gas estimate.
+5. Price it. Execute only if `reward - gasCost > MIN_LIQUIDATION_REWARD_USD`.
+6. Send, wait for the receipt, record the result.
+
+---
+
+## Profitability: read this before setting a threshold
+
+The reward mirrors the contract exactly, with every input read from chain:
+
+```
+notional = size * oraclePrice / 1e18        (pre-trade risk price, rounded up)
+penalty  = min(notional * liquidationPenaltyBps / 10000, penaltyCap)
+reward   = feeRouter set ? penalty / 2 : penalty
+```
+
+On the **current Sepolia markets**, verified on-chain:
+
+| Parameter | Value |
+| --- | --- |
+| `liquidationPenaltyBps` | 250 (2.5%) |
+| `penaltyCap` | `1000e18` |
+| FeeRouter | set on every market → 50/50 split |
+
+**The cap binds.** Your reward is capped at roughly **500 quote units per liquidation,
+no matter how large the position.** A percentage-of-notional mental model overstates
+what you earn on big positions. Set `MIN_LIQUIDATION_REWARD_USD` with that ceiling in
+mind — a threshold above ~500 will never fire.
+
+### Gas pricing
+
+These are GPU compute perps. No market's mark price tells you anything about ETH, so
+gas cannot be costed from market data. Set `ETH_PRICE_USD` yourself:
+
+```env
+ETH_PRICE_USD=3000
+```
+
+It is used **only** to convert gas into USD for the profitability comparison.
+
+---
+
+## Key settings
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `EXECUTE_MODE` | `false` | `true` to liquidate |
+| `DRY_RUN` | `false` | Simulate and price, never send |
+| `MIN_LIQUIDATION_REWARD_USD` | `10` | Net profit floor; remember the ~500 ceiling |
+| `MAX_GAS_PRICE_GWEI` | `50` | Skip above this |
+| `ETH_PRICE_USD` | `3000` | Gas costing only |
+| `AMOUNT_LIMIT_MODE` | `zero` | `zero` = no slippage guard, `mark` = derive from mark price |
+| `SLIPPAGE_BPS` | `50` | Only used when mode is `mark` |
+| `MARKET_IDS` | *(all)* | Comma-separated allowlist |
+| `START_BLOCK` | `10797215` | Deploy block; raise to speed up bootstrap |
+| `FUNDING_POKE_INTERVAL_MS` | `3600000` | Per-market `pokeFunding` cadence |
+
+### amountLimit
+
+`liquidate` takes an `amountLimit` guarding the vAMM leg against slippage: a minimum
+quote-out when closing a long, a maximum quote-in when closing a short. `zero`
+disables the guard, which is the sane default — the position is already underwater and
+you want the liquidation to land. Use `mark` if you want protection against a thin or
+manipulated vAMM, and raise `SLIPPAGE_BPS` if you see the transaction reverting.
+
+---
+
+## Stale oracles
+
+The CuOracle adapters revert with `CuOracleAdapter_PriceStale()` when a feed hasn't
+been refreshed inside its staleness window. On Sepolia this is common — at time of
+writing `B200-PERP-V2` was stale while `H200-PERP-V2`, `AWS-H100-PERP` and `T4-PERP`
+were fresh.
+
+**Nothing can be liquidated in a market with a stale oracle**, because `isLiquidatable`
+reverts too. The bot detects this, logs one warning per market per cycle, skips that
+market, and keeps going.
+
+To fix, refresh the feed using the price scripts in `bytestrikecontracts/script/`
+(e.g. `SetCuOracleETHPrice.s.sol`, `UpdateH200ProviderPrices.s.sol`).
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause |
+| --- | --- |
+| Refuses to start: *"not a whitelisted liquidator"* | Step 3 hasn't landed. Confirm with `--address`. |
+| *"Archive requests require a personal token"* | Public RPC. Use Alchemy/Infura, or raise `START_BLOCK`. |
+| *"stale oracle price - skipping"* | Feed needs refreshing. Not a bot bug. |
+| `NotLiquidatable` on simulate | Front-run, or the price recovered. A clean skip. |
+| `InvalidSize` | Position changed under you. The bot re-reads size, so this should be rare. |
+| `RemainingBelowMinLiquidateFull` | A partial liquidation would leave dust below `minPositionSize`. |
+| Everything logged as "not profitable" | Check `MIN_LIQUIDATION_REWARD_USD` against the ~500 reward ceiling. |
+| Zero positions found | Backfill never completed — almost always the RPC. |
+
+---
+
+## Security
+
+- Dedicated wallet, gas only. Never a main key.
+- `.env` is gitignored. Keep it that way.
+- Start in `DRY_RUN`. Only disable it once you've seen a simulation pass.
+- This is Sepolia. Re-audit the profitability model and the `penaltyCap` before
+  pointing this at mainnet value.

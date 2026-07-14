@@ -1,25 +1,40 @@
 /**
- * Liquidation Executor Module
- * Handles execution of liquidations and funding pokes with profitability checks
+ * Liquidation execution with profitability checks.
+ *
+ * The reward model mirrors ClearingHouse.liquidate exactly: penalty is derived
+ * from the pre-trade risk (oracle) price, rounded up, clamped by penaltyCap, and
+ * split with the FeeRouter when one is configured. All of those inputs are read
+ * from chain rather than assumed - getting any of them wrong silently turns a
+ * profitable liquidation into a loss.
  */
 
+import { formatUnits } from 'viem';
 import { config } from './config';
 import {
-  executeLiquidation,
+  getPosition,
+  getRiskParams,
+  getMarket,
+  getOraclePrice,
+  isLiquidatable,
+  isMarketActive,
+  computeAmountLimit,
+  simulateLiquidation,
+  sendLiquidation,
   executePokeFunding,
   waitForTransaction,
-  getGasPrice,
-  estimateLiquidationGas,
+  getGasPriceGwei,
   getLiquidatorAddress,
-  getMarkPrice,
+  hasFeeRouter,
 } from './blockchain';
-import { TrackedPosition, MarginHealth } from './types';
 
-// Execution statistics
+const WAD = 10n ** 18n;
+const BPS = 10_000n;
+
 export interface ExecutionStats {
-  totalLiquidations: number;
-  successfulLiquidations: number;
-  failedLiquidations: number;
+  attempted: number;
+  successful: number;
+  failed: number;
+  skipped: number;
   totalRewardsUsd: number;
   totalGasCostUsd: number;
   lastLiquidationTime: Date | null;
@@ -27,254 +42,229 @@ export interface ExecutionStats {
 }
 
 const stats: ExecutionStats = {
-  totalLiquidations: 0,
-  successfulLiquidations: 0,
-  failedLiquidations: 0,
+  attempted: 0,
+  successful: 0,
+  failed: 0,
+  skipped: 0,
   totalRewardsUsd: 0,
   totalGasCostUsd: 0,
   lastLiquidationTime: null,
   lastFundingPokeTime: null,
 };
 
-/**
- * Calculate expected liquidation reward in USD
- * @param position Position data
- * @param health Margin health data
- * @param markPrice Current mark price
- * @returns Expected reward in USD
- */
-function calculateExpectedReward(
-  position: TrackedPosition,
-  health: MarginHealth,
-  markPrice: bigint
-): number {
-  // Calculate notional value
-  const absSize = health.notionalValue;
-
-  // Penalty is typically 2% of notional (200 bps)
-  // Liquidator gets 50% of penalty (1% of notional)
-  const penaltyBps = 200; // 2%
-  const liquidatorShare = 0.5; // 50% of penalty
-
-  const notionalUsd = Number(absSize) / 1e18;
-  const penalty = notionalUsd * (penaltyBps / 10000);
-  const liquidatorReward = penalty * liquidatorShare;
-
-  return liquidatorReward;
+function mulDivRoundingUp(a: bigint, b: bigint, denominator: bigint): bigint {
+  return (a * b + denominator - 1n) / denominator;
 }
 
 /**
- * Check if liquidation is profitable after gas costs
- * @param account Account to liquidate
- * @param marketId Market ID
- * @param position Position data
- * @param health Margin health
- * @returns true if profitable, false otherwise
+ * Liquidator's share of the penalty, in X18 quote units.
+ * Mirrors the contract; notably penaltyCap can clamp this to near-zero, which is
+ * why the cap is read rather than assumed.
  */
-export async function isProfitable(
-  account: `0x${string}`,
+export async function estimateRewardX18(
   marketId: `0x${string}`,
-  position: TrackedPosition,
-  health: MarginHealth
-): Promise<{ profitable: boolean; expectedRewardUsd: number; estimatedGasCostUsd: number }> {
-  try {
-    const markPrice = await getMarkPrice();
-    const expectedRewardUsd = calculateExpectedReward(position, health, markPrice);
+  liquidationSize: bigint
+): Promise<bigint> {
+  const market = await getMarket(marketId);
+  const [params, riskPriceX18] = await Promise.all([
+    getRiskParams(marketId),
+    getOraclePrice(market.oracle),
+  ]);
 
-    // Get current gas price
-    const gasPriceGwei = await getGasPrice();
-
-    // Check if gas price is acceptable
-    if (gasPriceGwei > config.maxGasPriceGwei) {
-      console.log(`⛽ Gas price too high: ${gasPriceGwei.toFixed(2)} gwei (max: ${config.maxGasPriceGwei})`);
-      return { profitable: false, expectedRewardUsd, estimatedGasCostUsd: 0 };
-    }
-
-    // Estimate gas cost
-    const absSize = position.position.size < 0n ? -position.position.size : position.position.size;
-    const gasUnits = await estimateLiquidationGas(account, marketId, absSize);
-
-    // Calculate gas cost in USD (assuming ETH price from mark price)
-    const ethPriceUsd = Number(markPrice) / 1e18;
-    const gasCostEth = (Number(gasUnits) * gasPriceGwei) / 1e9;
-    const gasCostUsd = gasCostEth * ethPriceUsd;
-
-    // Check profitability
-    const netProfit = expectedRewardUsd - gasCostUsd;
-    const profitable = netProfit > config.minLiquidationRewardUsd;
-
-    console.log(`💰 Profitability check:`);
-    console.log(`   Expected reward: $${expectedRewardUsd.toFixed(2)}`);
-    console.log(`   Estimated gas cost: $${gasCostUsd.toFixed(2)}`);
-    console.log(`   Net profit: $${netProfit.toFixed(2)}`);
-    console.log(`   Minimum required: $${config.minLiquidationRewardUsd}`);
-    console.log(`   Profitable: ${profitable ? '✅' : '❌'}`);
-
-    return { profitable, expectedRewardUsd, estimatedGasCostUsd: gasCostUsd };
-  } catch (error) {
-    console.error(`❌ Error checking profitability:`, error);
-    return { profitable: false, expectedRewardUsd: 0, estimatedGasCostUsd: 0 };
+  const notional = mulDivRoundingUp(liquidationSize, riskPriceX18, WAD);
+  let penalty = mulDivRoundingUp(notional, params.liquidationPenaltyBps, BPS);
+  if (params.penaltyCap > 0n && penalty > params.penaltyCap) {
+    penalty = params.penaltyCap;
   }
+
+  // FeeRouter present => protocol takes half.
+  return hasFeeRouter(market) ? penalty - penalty / 2n : penalty;
+}
+
+/** The quote token is a USD stablecoin, and quote amounts are X18-normalized. */
+function quoteX18ToUsd(amount: bigint): number {
+  return Number(formatUnits(amount, 18));
 }
 
 /**
- * Execute a liquidation with safety checks
- * @param account Account to liquidate
- * @param marketId Market ID
- * @param position Position data
- * @param health Margin health
+ * Liquidate a position. Returns true only when a transaction actually landed
+ * on-chain successfully.
  */
 export async function executeLiquidationSafely(
   account: `0x${string}`,
-  marketId: `0x${string}`,
-  position: TrackedPosition,
-  health: MarginHealth
+  marketId: `0x${string}`
 ): Promise<boolean> {
-  const liquidatorAddress = getLiquidatorAddress();
+  const liquidator = getLiquidatorAddress();
 
-  console.log(`\n🎯 Attempting liquidation:`);
-  console.log(`   Account: ${account}`);
-  console.log(`   Market: ${marketId}`);
-  console.log(`   Position size: ${position.position.size}`);
-  console.log(`   Liquidator: ${liquidatorAddress}`);
+  // Re-read size from chain. The tracker's copy is a cache and the contract
+  // requires 0 < size <= current absSize, so a stale size reverts as InvalidSize.
+  const position = await getPosition(account, marketId);
+  if (position.size === 0n) return false;
 
-  // Dry run mode - simulate but don't execute
-  if (config.dryRun) {
-    console.log(`🔍 DRY RUN MODE - Skipping actual execution`);
-    stats.totalLiquidations++;
-    stats.successfulLiquidations++;
-    stats.lastLiquidationTime = new Date();
-    return true;
-  }
-
-  // Check profitability
-  const { profitable, expectedRewardUsd, estimatedGasCostUsd } = await isProfitable(
-    account,
-    marketId,
-    position,
-    health
-  );
-
-  if (!profitable) {
-    console.log(`❌ Liquidation not profitable - skipping`);
+  if (!(await isMarketActive(marketId))) {
+    console.log(`⏸️  Market ${marketId.slice(0, 10)}... is not active - skipping`);
     return false;
   }
 
+  // Re-check against the chain: another liquidator may have front-run us, or a
+  // price move may have restored the position.
+  if (!(await isLiquidatable(account, marketId))) {
+    console.log(`↩️  ${account.slice(0, 10)}... no longer liquidatable - skipping`);
+    return false;
+  }
+
+  const liquidationSize = position.size < 0n ? -position.size : position.size;
+
+  console.log(`\n🎯 Liquidation candidate`);
+  console.log(`   Account:    ${account}`);
+  console.log(`   Market:     ${marketId}`);
+  console.log(`   Size:       ${formatUnits(liquidationSize, 18)} (${position.size > 0n ? 'LONG' : 'SHORT'})`);
+  console.log(`   Liquidator: ${liquidator}`);
+
+  const gasPriceGwei = await getGasPriceGwei();
+  if (gasPriceGwei > config.maxGasPriceGwei) {
+    console.log(`⛽ Gas price ${gasPriceGwei.toFixed(2)} gwei exceeds max ${config.maxGasPriceGwei} - skipping`);
+    stats.skipped++;
+    return false;
+  }
+
+  const amountLimit = await computeAmountLimit(marketId, position.size, liquidationSize);
+
+  // Simulate before costing: it both catches reverts early and yields the gas
+  // number the profitability check needs.
+  let request;
   try {
-    stats.totalLiquidations++;
-
-    // Execute liquidation
-    const absSize = position.position.size < 0n ? -position.position.size : position.position.size;
-    console.log(`⚡ Executing liquidation transaction...`);
-
-    const hash = await executeLiquidation(account, marketId, absSize);
-    console.log(`📝 Transaction sent: ${hash}`);
-    console.log(`   View on Etherscan: https://sepolia.etherscan.io/tx/${hash}`);
-
-    // Wait for confirmation
-    console.log(`⏳ Waiting for confirmation...`);
-    const receipt = await waitForTransaction(hash);
-
-    if (receipt.status === 'success') {
-      stats.successfulLiquidations++;
-      stats.totalRewardsUsd += expectedRewardUsd;
-      stats.totalGasCostUsd += estimatedGasCostUsd;
-      stats.lastLiquidationTime = new Date();
-
-      console.log(`✅ Liquidation successful!`);
-      console.log(`   Block: ${receipt.blockNumber}`);
-      console.log(`   Gas used: ${receipt.gasUsed}`);
-      console.log(`   Estimated reward: $${expectedRewardUsd.toFixed(2)}`);
-
-      return true;
-    } else {
-      stats.failedLiquidations++;
-      console.log(`❌ Liquidation transaction failed`);
-      return false;
-    }
+    request = await simulateLiquidation(account, marketId, liquidationSize, amountLimit);
   } catch (error: any) {
-    stats.failedLiquidations++;
-    console.error(`❌ Liquidation execution failed:`, error.message || error);
+    console.warn(`🚫 Simulation reverted: ${error.shortMessage || error.message}`);
+    explainRevert(error, liquidator);
+    stats.skipped++;
+    return false;
+  }
 
-    // Check if it's a known error
-    if (error.message?.includes('Not liquidatable')) {
-      console.log(`   Reason: Position is no longer liquidatable (front-run?)`);
-    } else if (error.message?.includes('Caller is not a whitelisted liquidator')) {
-      console.log(`   Reason: Liquidator address not whitelisted!`);
-      console.log(`   ⚠️  You need to whitelist ${liquidatorAddress} as a liquidator`);
+  const rewardX18 = await estimateRewardX18(marketId, liquidationSize);
+  const rewardUsd = quoteX18ToUsd(rewardX18);
+
+  const gasUnits = request.gas ?? config.gasLimit;
+  const gasCostEth = (Number(gasUnits) * gasPriceGwei) / 1e9;
+  const gasCostUsd = gasCostEth * config.ethPriceUsd;
+  const netProfitUsd = rewardUsd - gasCostUsd;
+  const profitable = netProfitUsd > config.minLiquidationRewardUsd;
+
+  console.log(`💰 Profitability`);
+  console.log(`   Expected reward:  $${rewardUsd.toFixed(2)}`);
+  console.log(`   Est. gas cost:    $${gasCostUsd.toFixed(2)} (${gasUnits} units @ ${gasPriceGwei.toFixed(2)} gwei, ETH=$${config.ethPriceUsd})`);
+  console.log(`   Net profit:       $${netProfitUsd.toFixed(2)}`);
+  console.log(`   Minimum required: $${config.minLiquidationRewardUsd}`);
+  console.log(`   Profitable:       ${profitable ? '✅' : '❌'}`);
+
+  if (!profitable) {
+    stats.skipped++;
+    return false;
+  }
+
+  if (config.dryRun) {
+    console.log(`🔍 DRY RUN - simulation passed and liquidation is profitable, not sending`);
+    stats.skipped++;
+    return false;
+  }
+
+  stats.attempted++;
+
+  try {
+    const hash = await sendLiquidation(request);
+    console.log(`📝 Sent: https://sepolia.etherscan.io/tx/${hash}`);
+
+    const receipt = await waitForTransaction(hash);
+    if (receipt.status === 'success') {
+      stats.successful++;
+      stats.totalRewardsUsd += rewardUsd;
+      stats.totalGasCostUsd += (Number(receipt.gasUsed) * gasPriceGwei) / 1e9 * config.ethPriceUsd;
+      stats.lastLiquidationTime = new Date();
+      console.log(`✅ Liquidated in block ${receipt.blockNumber} (gas used: ${receipt.gasUsed})`);
+      return true;
     }
 
+    stats.failed++;
+    console.log(`❌ Transaction reverted on-chain (block ${receipt.blockNumber})`);
+    return false;
+  } catch (error: any) {
+    stats.failed++;
+    console.error(`❌ Liquidation failed: ${error.shortMessage || error.message}`);
+    explainRevert(error, liquidator);
     return false;
   }
 }
 
-/**
- * Poke funding rate update
- * @returns true if successful
- */
-export async function pokeFundingSafely(): Promise<boolean> {
-  console.log(`\n🔄 Poking funding rate...`);
+// The ClearingHouse reverts with custom errors, so match on those names.
+function explainRevert(error: any, liquidator: string | null): void {
+  const message = `${error?.shortMessage ?? ''} ${error?.message ?? ''}`;
+
+  if (/NotLiquidatable/i.test(message)) {
+    console.log(`   Position is no longer liquidatable (likely front-run).`);
+  } else if (/onlyWhitelistedLiquidator|not whitelisted/i.test(message)) {
+    console.log(`   ⚠️  ${liquidator} is not whitelisted. Admin must call setWhitelistedLiquidator.`);
+  } else if (/InvalidSize/i.test(message)) {
+    console.log(`   Size no longer matches the on-chain position.`);
+  } else if (/MarketNotActive/i.test(message)) {
+    console.log(`   Market is paused or inactive.`);
+  } else if (/RemainingBelowMinLiquidateFull/i.test(message)) {
+    console.log(`   Partial liquidation would leave dust below minPositionSize.`);
+  } else if (/SlippageExceeded|amountLimit/i.test(message)) {
+    console.log(`   amountLimit too tight - raise SLIPPAGE_BPS or set AMOUNT_LIMIT_MODE=zero.`);
+  }
+}
+
+export async function pokeFundingSafely(marketId: `0x${string}`): Promise<boolean> {
+  const gasPriceGwei = await getGasPriceGwei();
+  if (gasPriceGwei > config.maxGasPriceGwei) {
+    console.log(`⛽ Gas price too high (${gasPriceGwei.toFixed(2)} gwei) - skipping funding poke`);
+    return false;
+  }
 
   if (config.dryRun) {
-    console.log(`🔍 DRY RUN MODE - Skipping actual execution`);
-    stats.lastFundingPokeTime = new Date();
-    return true;
+    console.log(`🔍 DRY RUN - skipping funding poke for ${marketId.slice(0, 10)}...`);
+    return false;
   }
 
   try {
-    const gasPriceGwei = await getGasPrice();
-
-    if (gasPriceGwei > config.maxGasPriceGwei) {
-      console.log(`⛽ Gas price too high: ${gasPriceGwei.toFixed(2)} gwei - skipping`);
-      return false;
-    }
-
-    console.log(`⚡ Executing pokeFunding transaction...`);
-    const hash = await executePokeFunding();
-    console.log(`📝 Transaction sent: ${hash}`);
-
-    console.log(`⏳ Waiting for confirmation...`);
+    const hash = await executePokeFunding(marketId);
     const receipt = await waitForTransaction(hash);
 
     if (receipt.status === 'success') {
       stats.lastFundingPokeTime = new Date();
-      console.log(`✅ Funding poke successful!`);
-      console.log(`   Block: ${receipt.blockNumber}`);
+      console.log(`✅ Funding poked for ${marketId.slice(0, 10)}... (block ${receipt.blockNumber})`);
       return true;
-    } else {
-      console.log(`❌ Funding poke transaction failed`);
-      return false;
     }
+
+    console.log(`❌ Funding poke reverted for ${marketId.slice(0, 10)}...`);
+    return false;
   } catch (error: any) {
-    console.error(`❌ Funding poke failed:`, error.message || error);
+    console.error(`❌ Funding poke failed: ${error.shortMessage || error.message}`);
     return false;
   }
 }
 
-/**
- * Get execution statistics
- */
 export function getExecutionStats(): ExecutionStats {
   return { ...stats };
 }
 
-/**
- * Log execution statistics
- */
 export function logExecutionStats(): void {
-  console.log(`\n📊 Execution Statistics:`);
-  console.log(`   Total liquidations attempted: ${stats.totalLiquidations}`);
-  console.log(`   Successful: ${stats.successfulLiquidations}`);
-  console.log(`   Failed: ${stats.failedLiquidations}`);
-  if (stats.successfulLiquidations > 0) {
-    console.log(`   Total rewards: $${stats.totalRewardsUsd.toFixed(2)}`);
-    console.log(`   Total gas costs: $${stats.totalGasCostUsd.toFixed(2)}`);
+  console.log(`\n📊 Execution stats`);
+  console.log(`   Attempted:  ${stats.attempted}`);
+  console.log(`   Successful: ${stats.successful}`);
+  console.log(`   Failed:     ${stats.failed}`);
+  console.log(`   Skipped:    ${stats.skipped}`);
+
+  if (stats.successful > 0) {
+    console.log(`   Rewards:    $${stats.totalRewardsUsd.toFixed(2)}`);
+    console.log(`   Gas costs:  $${stats.totalGasCostUsd.toFixed(2)}`);
     console.log(`   Net profit: $${(stats.totalRewardsUsd - stats.totalGasCostUsd).toFixed(2)}`);
   }
   if (stats.lastLiquidationTime) {
-    console.log(`   Last liquidation: ${stats.lastLiquidationTime.toLocaleString()}`);
+    console.log(`   Last liquidation: ${stats.lastLiquidationTime.toISOString()}`);
   }
   if (stats.lastFundingPokeTime) {
-    console.log(`   Last funding poke: ${stats.lastFundingPokeTime.toLocaleString()}`);
+    console.log(`   Last funding poke: ${stats.lastFundingPokeTime.toISOString()}`);
   }
 }

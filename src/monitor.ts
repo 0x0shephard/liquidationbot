@@ -1,128 +1,139 @@
 import { config } from './config';
-import { calculateMarginHealth, getMarkPrice, getOraclePrice } from './blockchain';
-import { getAllTrackedPositions, updateTrackedPosition, syncNewEvents, getTrackerStats } from './tracker';
-import { sendEmailAlert, logAlert } from './notifications';
+import {
+  calculateMarginHealth,
+  getPosition,
+  getMarket,
+  getOraclePrice,
+  getMarkPrice,
+  isStaleOracleError,
+} from './blockchain';
+import {
+  getAllTrackedPositions,
+  updateTrackedPosition,
+  removePosition,
+  syncNewEvents,
+  getTrackerStats,
+} from './tracker';
+import { sendEmailAlert } from './notifications';
 import { executeLiquidationSafely, pokeFundingSafely, logExecutionStats } from './executor';
 import { HealthStatus, AlertData } from './types';
 
-// Track last funding poke time
-let lastFundingPokeTime = 0;
+// Funding is poked per-market, since each market has its own vAMM.
+const lastFundingPokeByMarket = new Map<string, number>();
 
-// Monitor all tracked positions
+async function maybePokeFunding(marketIds: Set<string>): Promise<void> {
+  const now = Date.now();
+
+  for (const marketId of marketIds) {
+    const last = lastFundingPokeByMarket.get(marketId) ?? 0;
+    if (now - last < config.fundingPokeIntervalMs) continue;
+
+    console.log(`\n⏰ Poking funding for ${marketId.slice(0, 10)}...`);
+    if (await pokeFundingSafely(marketId as `0x${string}`)) {
+      lastFundingPokeByMarket.set(marketId, now);
+    }
+  }
+}
+
 export async function monitorPositions(): Promise<void> {
-  // First sync any new events
   await syncNewEvents();
 
   const positions = getAllTrackedPositions();
   const stats = getTrackerStats();
 
-  console.log(`\n[${new Date().toISOString()}] Monitoring ${positions.length} positions...`);
-  console.log(`Status: ${stats.safe} safe, ${stats.warning} warning, ${stats.liquidatable} liquidatable`);
-
-  // Poke funding periodically if execution mode is enabled
-  if (config.executeMode) {
-    const now = Date.now();
-    if (now - lastFundingPokeTime >= config.fundingPokeIntervalMs) {
-      console.log(`\n⏰ Time to poke funding (${config.fundingPokeIntervalMs / 60000} minutes elapsed)`);
-      const success = await pokeFundingSafely();
-      if (success) {
-        lastFundingPokeTime = now;
-      }
-    }
-  }
+  console.log(`\n[${new Date().toISOString()}] Checking ${positions.length} position(s)`);
+  console.log(`  ${stats.safe} safe, ${stats.warning} warning, ${stats.liquidatable} liquidatable`);
 
   if (positions.length === 0) {
-    console.log('No positions to monitor');
+    console.log('No open positions');
     return;
   }
 
-  // Get current market data
-  const [markPrice, oraclePrice] = await Promise.all([
-    getMarkPrice(),
-    getOraclePrice('ETH'),
-  ]);
+  if (config.executeMode) {
+    await maybePokeFunding(new Set(positions.map((p) => p.marketId)));
+  }
 
-  console.log(`Mark Price: $${Number(markPrice) / 1e18}`);
-  console.log(`Oracle Price: $${Number(oraclePrice) / 1e18}`);
+  let scanned = 0;
+  const staleMarkets = new Set<string>();
 
-  // Check each position
   for (const tracked of positions) {
-    try {
-      const health = await calculateMarginHealth(tracked.account, tracked.marketId);
+    if (scanned >= config.maxPositionsPerScan) {
+      console.log(`Reached MAX_POSITIONS_PER_SCAN (${config.maxPositionsPerScan}) - remaining positions next cycle`);
+      break;
+    }
+    scanned++;
 
-      // Update tracked position
+    try {
+      const position = await getPosition(tracked.account, tracked.marketId);
+
+      // Closed or fully liquidated between our last sync and now.
+      if (position.size === 0n) {
+        removePosition(tracked.account, tracked.marketId);
+        continue;
+      }
+
+      const health = await calculateMarginHealth(tracked.account, tracked.marketId, position);
+      const previousStatus = tracked.healthStatus;
+
       updateTrackedPosition(tracked.account, tracked.marketId, {
+        size: position.size,
         healthStatus: health.status,
         lastChecked: Date.now(),
       });
 
-      // Check if alert needed
-      const alertData: AlertData = {
+      const alert: AlertData = {
         account: tracked.account,
         marketId: tracked.marketId,
         health,
-        position: tracked.position,
-        markPrice,
+        position,
         timestamp: Date.now(),
       };
 
-      // Handle LIQUIDATABLE positions
       if (health.status === HealthStatus.LIQUIDATABLE) {
-        console.log(`🚨 LIQUIDATABLE position found: ${tracked.account.slice(0, 10)}...`);
+        console.log(`🚨 LIQUIDATABLE: ${tracked.account.slice(0, 10)}... in ${tracked.marketId.slice(0, 10)}...`);
 
-        // Execute liquidation if in execution mode
         if (config.executeMode) {
-          const success = await executeLiquidationSafely(
-            tracked.account,
-            tracked.marketId,
-            tracked,
-            health
-          );
-
-          if (success) {
-            console.log(`✅ Liquidation executed successfully`);
-            // Send success notification
-            await sendEmailAlert({
-              ...alertData,
-              executionResult: 'success',
-            });
+          const liquidated = await executeLiquidationSafely(tracked.account, tracked.marketId);
+          if (liquidated) {
+            removePosition(tracked.account, tracked.marketId);
+            await sendEmailAlert({ ...alert, executionResult: 'success' });
           } else {
-            console.log(`❌ Liquidation failed or skipped (not profitable)`);
+            await sendEmailAlert({ ...alert, executionResult: 'skipped' });
           }
         } else {
-          // Monitoring mode - just send alert
-          console.log(`👁️  Monitoring mode - sending alert only`);
-          await sendEmailAlert(alertData);
+          await sendEmailAlert(alert);
         }
-      }
-      // Handle WARNING positions
-      else if (health.status === HealthStatus.WARNING) {
-        // Check if status changed
-        const statusChanged = tracked.healthStatus !== health.status;
-
-        if (statusChanged) {
-          console.log(`⚠️  WARNING: ${tracked.account.slice(0, 10)}... - margin running low`);
-          await sendEmailAlert(alertData);
-        } else {
-          console.log(`⚠️  Position ${tracked.account.slice(0, 10)}... still in WARNING status`);
+      } else if (health.status === HealthStatus.WARNING) {
+        if (previousStatus !== HealthStatus.WARNING) {
+          console.log(`⚠️  WARNING: ${tracked.account.slice(0, 10)}... margin below IMR`);
+          await sendEmailAlert(alert);
         }
+      } else if (previousStatus !== HealthStatus.SAFE) {
+        console.log(`✅ ${tracked.account.slice(0, 10)}... recovered to SAFE`);
       }
-      // Position recovered
-      else if (tracked.healthStatus !== HealthStatus.SAFE && health.status === HealthStatus.SAFE) {
-        console.log(`✅ Position ${tracked.account.slice(0, 10)}... recovered to SAFE status`);
+    } catch (error: any) {
+      // A stale oracle makes every position in that market unreadable, so report
+      // it once per market per cycle instead of once per position.
+      if (isStaleOracleError(error)) {
+        if (!staleMarkets.has(tracked.marketId)) {
+          staleMarkets.add(tracked.marketId);
+          console.warn(
+            `⏭️  Market ${tracked.marketId.slice(0, 10)}... has a stale oracle price - skipping until it is refreshed`
+          );
+        }
+        continue;
       }
-    } catch (error) {
-      console.error(`❌ Error checking position for ${tracked.account}:`, error);
+      console.error(`❌ Error checking ${tracked.account}: ${error.shortMessage || error.message}`);
     }
   }
 
-  // Log execution stats if in execution mode
-  if (config.executeMode) {
-    logExecutionStats();
+  if (staleMarkets.size > 0) {
+    console.warn(`⚠️  ${staleMarkets.size} market(s) skipped this cycle due to stale oracle prices.`);
   }
+
+  if (config.executeMode) logExecutionStats();
 }
 
-// Start the monitoring loop
 let monitoringInterval: NodeJS.Timeout | null = null;
 
 export function startMonitoring(): void {
@@ -131,17 +142,11 @@ export function startMonitoring(): void {
     return;
   }
 
-  console.log(`Starting monitoring loop (interval: ${config.pollingIntervalMs}ms)...`);
-
-  // Run immediately
+  console.log(`Starting monitor loop (every ${config.pollingIntervalMs}ms)`);
   monitorPositions().catch(console.error);
-
-  // Then run on interval
   monitoringInterval = setInterval(() => {
     monitorPositions().catch(console.error);
   }, config.pollingIntervalMs);
-
-  console.log('Monitoring started');
 }
 
 export function stopMonitoring(): void {
@@ -152,24 +157,29 @@ export function stopMonitoring(): void {
   }
 }
 
-// Price monitoring for market overview
-export async function logMarketStatus(): Promise<void> {
-  try {
-    const [markPrice, oraclePrice] = await Promise.all([
-      getMarkPrice(),
-      getOraclePrice('ETH'),
-    ]);
+/** Log oracle vs mark price for each market we currently have exposure to. */
+export async function logMarketStatus(marketIds: `0x${string}`[]): Promise<void> {
+  if (marketIds.length === 0) return;
 
-    const markPriceNum = Number(markPrice) / 1e18;
-    const oraclePriceNum = Number(oraclePrice) / 1e18;
-    const premium = ((markPriceNum - oraclePriceNum) / oraclePriceNum) * 100;
+  console.log('\n--- Market status ---');
+  for (const marketId of marketIds) {
+    try {
+      const market = await getMarket(marketId);
+      const [oraclePrice, markPrice] = await Promise.all([
+        getOraclePrice(market.oracle),
+        getMarkPrice(market.vamm),
+      ]);
 
-    console.log('\n--- Market Status ---');
-    console.log(`Mark Price: $${markPriceNum.toFixed(4)}`);
-    console.log(`Oracle Price: $${oraclePriceNum.toFixed(4)}`);
-    console.log(`Premium: ${premium.toFixed(4)}%`);
-    console.log('--------------------\n');
-  } catch (error) {
-    console.error('Error fetching market status:', error);
+      const oracleNum = Number(oraclePrice) / 1e18;
+      const markNum = Number(markPrice) / 1e18;
+      const premium = oracleNum > 0 ? ((markNum - oracleNum) / oracleNum) * 100 : 0;
+
+      console.log(
+        `${marketId.slice(0, 10)}...  oracle $${oracleNum.toFixed(4)}  mark $${markNum.toFixed(4)}  premium ${premium.toFixed(3)}%${market.paused ? '  [PAUSED]' : ''}`
+      );
+    } catch (error: any) {
+      console.error(`${marketId.slice(0, 10)}...  error: ${error.shortMessage || error.message}`);
+    }
   }
+  console.log('---------------------\n');
 }

@@ -1,143 +1,32 @@
-// Minimal ABIs for the contracts we need to interact with
+// ABIs for the ByteStrike contracts deployed on Sepolia.
+// Source of truth: bytestrikecontracts/src/{ClearingHouse,VAMM}.sol and src/Interfaces/.
+import { parseAbi, parseAbiItem } from 'viem';
 
-export const clearingHouseAbi = [
-  {
-    inputs: [
-      { name: 'account', type: 'address' },
-      { name: 'marketId', type: 'bytes32' }
-    ],
-    name: 'getPosition',
-    outputs: [
-      {
-        components: [
-          { name: 'size', type: 'int128' },
-          { name: 'margin', type: 'uint128' },
-          { name: 'entryPriceX18', type: 'uint256' },
-          { name: 'lastFundingIndex', type: 'int256' },
-          { name: 'realizedPnL', type: 'int256' }
-        ],
-        name: '',
-        type: 'tuple'
-      }
-    ],
-    stateMutability: 'view',
-    type: 'function'
-  },
-  {
-    inputs: [
-      { name: 'account', type: 'address' },
-      { name: 'marketId', type: 'bytes32' }
-    ],
-    name: 'isLiquidatable',
-    outputs: [{ name: '', type: 'bool' }],
-    stateMutability: 'view',
-    type: 'function'
-  },
-  {
-    inputs: [
-      { name: 'account', type: 'address' },
-      { name: 'marketId', type: 'bytes32' }
-    ],
-    name: 'getMaintenanceMargin',
-    outputs: [{ name: '', type: 'uint256' }],
-    stateMutability: 'view',
-    type: 'function'
-  },
-  // Events for tracking positions
-  {
-    anonymous: false,
-    inputs: [
-      { indexed: true, name: 'marketId', type: 'bytes32' },
-      { indexed: true, name: 'account', type: 'address' },
-      { indexed: false, name: 'sizeDelta', type: 'int128' },
-      { indexed: false, name: 'newSize', type: 'int128' },
-      { indexed: false, name: 'avgEntryPriceX18', type: 'uint256' },
-      { indexed: false, name: 'newMarginReq', type: 'uint256' }
-    ],
-    name: 'PositionOpened',
-    type: 'event'
-  },
-  {
-    anonymous: false,
-    inputs: [
-      { indexed: true, name: 'marketId', type: 'bytes32' },
-      { indexed: true, name: 'account', type: 'address' },
-      { indexed: false, name: 'sizeClosed', type: 'uint128' },
-      { indexed: false, name: 'remainingSize', type: 'int128' },
-      { indexed: false, name: 'realizedPnL', type: 'int256' },
-      { indexed: false, name: 'feesPaid', type: 'uint256' }
-    ],
-    name: 'PositionClosed',
-    type: 'event'
-  },
-  {
-    anonymous: false,
-    inputs: [
-      { indexed: true, name: 'marketId', type: 'bytes32' },
-      { indexed: true, name: 'liquidator', type: 'address' },
-      { indexed: true, name: 'account', type: 'address' },
-      { indexed: false, name: 'size', type: 'uint128' },
-      { indexed: false, name: 'notional', type: 'uint256' },
-      { indexed: false, name: 'penalty', type: 'uint256' },
-      { indexed: false, name: 'liquidatorReward', type: 'uint256' },
-      { indexed: false, name: 'protocolFee', type: 'uint256' },
-      { indexed: false, name: 'insurancePayout', type: 'uint256' }
-    ],
-    name: 'LiquidationExecuted',
-    type: 'event'
-  },
-  // Write function - liquidate
-  {
-    inputs: [
-      { name: 'account', type: 'address' },
-      { name: 'marketId', type: 'bytes32' },
-      { name: 'size', type: 'uint128' }
-    ],
-    name: 'liquidate',
-    outputs: [],
-    stateMutability: 'nonpayable',
-    type: 'function'
-  }
-] as const;
+export const clearingHouseAbi = parseAbi([
+  'event TradeExecuted(address indexed user, bytes32 indexed marketId, int256 baseDelta, int256 quoteDelta, uint256 executionPrice, int256 newSize, uint256 newMargin, int256 realizedPnL, uint256 fee)',
+  'function whitelistedLiquidators(address user) view returns (bool)',
+  'function getPosition(address account, bytes32 marketId) view returns ((int256 size,uint256 margin,uint256 entryPriceX18,uint256 lastFundingPayIndex,uint256 lastFundingReceiveIndex,int256 realizedPnL))',
+  'function isLiquidatable(address account, bytes32 marketId) view returns (bool)',
+  'function liquidate(address account, bytes32 marketId, uint128 size, uint256 amountLimit)',
+  'function marketRiskParams(bytes32 marketId) view returns (uint256 imrBps,uint256 mmrBps,uint256 liquidationPenaltyBps,uint256 penaltyCap,uint256 maxPositionSize,uint256 minPositionSize)',
+]);
 
-export const vammAbi = [
-  {
-    inputs: [],
-    name: 'getMarkPrice',
-    outputs: [{ name: '', type: 'uint256' }],
-    stateMutability: 'view',
-    type: 'function'
-  },
-  {
-    inputs: [{ name: 'window', type: 'uint32' }],
-    name: 'getTwap',
-    outputs: [{ name: '', type: 'uint256' }],
-    stateMutability: 'view',
-    type: 'function'
-  },
-  {
-    inputs: [],
-    name: 'cumulativeFundingPerUnitX18',
-    outputs: [{ name: '', type: 'int256' }],
-    stateMutability: 'view',
-    type: 'function'
-  },
-  // Write function - pokeFunding
-  {
-    inputs: [],
-    name: 'pokeFunding',
-    outputs: [],
-    stateMutability: 'nonpayable',
-    type: 'function'
-  }
-] as const;
+// Position discovery runs off TradeExecuted: it carries the post-trade newSize,
+// so open/close/resize/liquidate all collapse into a single signal.
+export const tradeExecutedEvent = parseAbiItem(
+  'event TradeExecuted(address indexed user, bytes32 indexed marketId, int256 baseDelta, int256 quoteDelta, uint256 executionPrice, int256 newSize, uint256 newMargin, int256 realizedPnL, uint256 fee)'
+);
 
-export const oracleAbi = [
-  {
-    inputs: [{ name: 'symbol', type: 'string' }],
-    name: 'getPrice',
-    outputs: [{ name: '', type: 'uint256' }],
-    stateMutability: 'view',
-    type: 'function'
-  }
-] as const;
+export const marketRegistryAbi = parseAbi([
+  'function getMarket(bytes32 marketId) view returns ((address vamm,uint16 feeBps,bool paused,address oracle,address feeRouter,address insuranceFund,address baseAsset,address quoteToken,uint256 baseUnit))',
+  'function isActive(bytes32 marketId) view returns (bool)',
+]);
+
+export const oracleAbi = parseAbi([
+  'function getPrice() view returns (uint256)',
+]);
+
+export const vammAbi = parseAbi([
+  'function getMarkPrice() view returns (uint256)',
+  'function pokeFunding() returns (uint256 longPay, uint256 longReceive, uint256 shortPay, uint256 shortReceive)',
+]);
