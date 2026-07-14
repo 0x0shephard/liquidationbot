@@ -164,20 +164,34 @@ export function startMonitoring(): void {
 
   console.log(`Starting monitor loop (every ${config.pollingIntervalMs}ms)`);
 
-  // A cycle failure must not kill the loop - a transient RPC blip would
-  // otherwise take the bot down until Railway restarts it.
-  const runCycle = () =>
-    monitorPositions()
-      .then(() => {
-        state.lastError = null;
-      })
-      .catch((error: any) => {
-        state.lastError = error.shortMessage || error.message || String(error);
-        console.error(`Cycle error: ${state.lastError}`);
-      });
+  // A full scan can exceed the polling interval (many positions x several RPC
+  // calls each). Without this guard setInterval starts a second cycle on top of
+  // the first, and two cycles can both decide to liquidate the same position -
+  // the loser burns gas on a revert. Skip the tick instead of overlapping.
+  let cycleInFlight = false;
 
-  runCycle();
-  monitoringInterval = setInterval(runCycle, config.pollingIntervalMs);
+  const runCycle = async () => {
+    if (cycleInFlight) {
+      console.log('Previous cycle still running - skipping this tick');
+      return;
+    }
+    cycleInFlight = true;
+
+    try {
+      await monitorPositions();
+      state.lastError = null;
+    } catch (error: any) {
+      // A cycle failure must not kill the loop - a transient RPC blip would
+      // otherwise take the bot down until Railway restarts it.
+      state.lastError = error.shortMessage || error.message || String(error);
+      console.error(`Cycle error: ${state.lastError}`);
+    } finally {
+      cycleInFlight = false;
+    }
+  };
+
+  void runCycle();
+  monitoringInterval = setInterval(() => void runCycle(), config.pollingIntervalMs);
 }
 
 export function stopMonitoring(): void {

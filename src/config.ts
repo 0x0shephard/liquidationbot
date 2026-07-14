@@ -47,7 +47,11 @@ export const config = {
   privateKey: (process.env.PRIVATE_KEY as `0x${string}`) || '',
   executeMode: process.env.EXECUTE_MODE === 'true',
   dryRun: process.env.DRY_RUN === 'true',
-  gasLimit: big('GAS_LIMIT', 900_000n),
+  // Upper sanity bound, not the gas actually sent - that comes from estimation.
+  // liquidate() settles funding across every market the account is active in, so
+  // a multi-market account really does cost >1.1M gas. 900k was too low and made
+  // simulations run out of gas.
+  gasLimit: big('GAS_LIMIT', 3_000_000n),
 
   // liquidate() takes an amountLimit (slippage guard on the vAMM leg).
   // 'zero' disables the guard; 'mark' derives it from the mark price.
@@ -57,6 +61,11 @@ export const config = {
   // Profitability
   minLiquidationRewardUsd: float('MIN_LIQUIDATION_REWARD_USD', 10),
   maxGasPriceGwei: float('MAX_GAS_PRICE_GWEI', 50),
+
+  // When false, liquidate anything the simulation accepts, even at a net loss.
+  // Reasonable on testnet (gas is free, clearing bad debt is the point); on
+  // mainnet this hands value away on every dust position.
+  requireProfitable: process.env.REQUIRE_PROFITABLE !== 'false',
   // Gas is paid in ETH but rewards are paid in the quote token. These are GPU
   // compute perps, so a market's mark price says nothing about ETH - the ETH
   // price has to come from outside.
@@ -110,6 +119,9 @@ export function validateConfig(): void {
     console.log('⚡ EXECUTION MODE ENABLED - Bot will execute liquidations');
     if (config.dryRun) {
       console.log('🔍 DRY RUN MODE - Transactions will be simulated but not sent');
+    }
+    if (!config.requireProfitable) {
+      console.log('💸 REQUIRE_PROFITABLE=false - liquidating regardless of profit, INCLUDING at a net loss');
     }
   } else {
     console.log('👁️  MONITORING MODE - Bot will only alert, not execute');

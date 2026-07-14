@@ -3,6 +3,32 @@
 import { parseAbi, parseAbiItem } from 'viem';
 
 export const clearingHouseAbi = parseAbi([
+  // Custom errors must be in the ABI or viem cannot decode a revert, and every
+  // failure degrades to a bare 'the contract function "liquidate" reverted'.
+  'error NotLiquidatable()',
+  'error NotWhitelistedLiquidator()',
+  'error MarketNotActive()',
+  'error MarketNotFound()',
+  'error InvalidSize()',
+  'error SizeZero()',
+  'error NoPosition()',
+  'error MustLiquidateMore()',
+  'error RemainingBelowMinLiquidateFull()',
+  'error BelowMinSize()',
+  'error ExceedsMaxSize()',
+  'error MarginBelowPenalty()',
+  'error InsufficientMargin()',
+  'error InsufficientBalance()',
+  'error InsufficientQuoteBalance()',
+  'error InsufficientQuoteCollateral()',
+  'error OracleNotSet()',
+  'error OraclePriceZero()',
+  'error QuoteOracleUnavailable()',
+  'error QuoteTokenValuationUnavailable()',
+  'error RiskParamsNotSet()',
+  'error AmountZero()',
+  'error ZeroAddress()',
+
   'event TradeExecuted(address indexed user, bytes32 indexed marketId, int256 baseDelta, int256 quoteDelta, uint256 executionPrice, int256 newSize, uint256 newMargin, int256 realizedPnL, uint256 fee)',
   'function whitelistedLiquidators(address user) view returns (bool)',
   'function getPosition(address account, bytes32 marketId) view returns ((int256 size,uint256 margin,uint256 entryPriceX18,uint256 lastFundingPayIndex,uint256 lastFundingReceiveIndex,int256 realizedPnL))',

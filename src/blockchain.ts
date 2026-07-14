@@ -130,20 +130,42 @@ export async function isMarketActive(marketId: `0x${string}`): Promise<boolean> 
   );
 }
 
-// Risk params are admin-settable, so re-read them each cycle rather than caching
-// for the process lifetime.
-export async function getRiskParams(marketId: `0x${string}`): Promise<MarketRiskParams> {
-  const [imrBps, mmrBps, liquidationPenaltyBps, penaltyCap, maxPositionSize, minPositionSize] =
-    await withRpcRetry(`marketRiskParams ${marketId}`, () =>
-      publicClient.readContract({
-        address: config.clearingHouseAddress,
-        abi: clearingHouseAbi,
-        functionName: 'marketRiskParams',
-        args: [marketId],
-      })
-    );
+/**
+ * Risk params and oracle prices are per-market, but a scan reads them once per
+ * *position* - with 72 positions across 19 markets that is ~4x more RPC calls
+ * than needed, and it pushed a cycle past the polling interval. A short TTL
+ * collapses them to one read per market per cycle.
+ *
+ * Deliberately short: risk params are admin-settable and prices move. Nothing
+ * safety-critical depends on this cache - isLiquidatable is always read fresh,
+ * and every liquidation is simulated against current state before sending.
+ */
+const CACHE_TTL_MS = 15_000;
+const ttlCache = new Map<string, { value: unknown; expires: number }>();
 
-  return { imrBps, mmrBps, liquidationPenaltyBps, penaltyCap, maxPositionSize, minPositionSize };
+async function cached<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const hit = ttlCache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.value as T;
+
+  const value = await fn();
+  ttlCache.set(key, { value, expires: Date.now() + CACHE_TTL_MS });
+  return value;
+}
+
+export async function getRiskParams(marketId: `0x${string}`): Promise<MarketRiskParams> {
+  return cached(`risk:${marketId}`, async () => {
+    const [imrBps, mmrBps, liquidationPenaltyBps, penaltyCap, maxPositionSize, minPositionSize] =
+      await withRpcRetry(`marketRiskParams ${marketId}`, () =>
+        publicClient.readContract({
+          address: config.clearingHouseAddress,
+          abi: clearingHouseAbi,
+          functionName: 'marketRiskParams',
+          args: [marketId],
+        })
+      );
+
+    return { imrBps, mmrBps, liquidationPenaltyBps, penaltyCap, maxPositionSize, minPositionSize };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -199,8 +221,10 @@ export async function isWhitelistedLiquidator(address: `0x${string}`): Promise<b
 }
 
 export async function getOraclePrice(oracle: `0x${string}`): Promise<bigint> {
-  return await withRpcRetry(`oracle.getPrice ${oracle}`, () =>
-    publicClient.readContract({ address: oracle, abi: oracleAbi, functionName: 'getPrice' })
+  return cached(`price:${oracle}`, () =>
+    withRpcRetry(`oracle.getPrice ${oracle}`, () =>
+      publicClient.readContract({ address: oracle, abi: oracleAbi, functionName: 'getPrice' })
+    )
   );
 }
 
@@ -350,16 +374,44 @@ export async function simulateLiquidation(
 ) {
   if (!walletClient) throw new Error('Wallet client not initialized - PRIVATE_KEY required');
 
+  // Do NOT pin gas here. liquidate() settles funding across every market the
+  // account is active in, so cost scales with their portfolio; a fixed cap makes
+  // the simulation run out of gas and revert with no error data. Letting viem
+  // estimate also means request.gas is a real estimate, which the profitability
+  // check depends on.
   const { request } = await publicClient.simulateContract({
     address: config.clearingHouseAddress,
     abi: clearingHouseAbi,
     functionName: 'liquidate',
     args: [account, marketId, size, amountLimit],
     account: walletClient.account,
-    gas: config.gasLimit,
   });
 
+  if (request.gas && request.gas > config.gasLimit) {
+    throw new Error(
+      `Liquidation needs ${request.gas} gas, above GAS_LIMIT ${config.gasLimit}. Raise GAS_LIMIT.`
+    );
+  }
+
   return request;
+}
+
+/** Real gas estimate. simulateContract does not populate request.gas. */
+export async function estimateLiquidationGas(
+  account: `0x${string}`,
+  marketId: `0x${string}`,
+  size: bigint,
+  amountLimit: bigint
+): Promise<bigint> {
+  if (!walletClient) throw new Error('Wallet client not initialized - PRIVATE_KEY required');
+
+  return await publicClient.estimateContractGas({
+    address: config.clearingHouseAddress,
+    abi: clearingHouseAbi,
+    functionName: 'liquidate',
+    args: [account, marketId, size, amountLimit],
+    account: walletClient.account,
+  });
 }
 
 export async function sendLiquidation(request: any): Promise<`0x${string}`> {

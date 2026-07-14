@@ -19,6 +19,7 @@ import {
   isMarketActive,
   computeAmountLimit,
   simulateLiquidation,
+  estimateLiquidationGas,
   sendLiquidation,
   executePokeFunding,
   waitForTransaction,
@@ -35,6 +36,7 @@ export interface ExecutionStats {
   successful: number;
   failed: number;
   skipped: number;
+  unprofitableExecutions: number;
   totalRewardsUsd: number;
   totalGasCostUsd: number;
   lastLiquidationTime: Date | null;
@@ -46,6 +48,7 @@ const stats: ExecutionStats = {
   successful: 0,
   failed: 0,
   skipped: 0,
+  unprofitableExecutions: 0,
   totalRewardsUsd: 0,
   totalGasCostUsd: 0,
   lastLiquidationTime: null,
@@ -145,7 +148,10 @@ export async function executeLiquidationSafely(
   const rewardX18 = await estimateRewardX18(marketId, liquidationSize);
   const rewardUsd = quoteX18ToUsd(rewardX18);
 
-  const gasUnits = request.gas ?? config.gasLimit;
+  // simulateContract leaves request.gas undefined, so estimate explicitly.
+  // Costing at GAS_LIMIT instead would overstate gas several-fold and reject
+  // liquidations that are actually profitable.
+  const gasUnits = await estimateLiquidationGas(account, marketId, liquidationSize, amountLimit);
   const gasCostEth = (Number(gasUnits) * gasPriceGwei) / 1e9;
   const gasCostUsd = gasCostEth * config.ethPriceUsd;
   const netProfitUsd = rewardUsd - gasCostUsd;
@@ -159,12 +165,24 @@ export async function executeLiquidationSafely(
   console.log(`   Profitable:       ${profitable ? '✅' : '❌'}`);
 
   if (!profitable) {
-    stats.skipped++;
-    return false;
+    if (config.requireProfitable) {
+      stats.skipped++;
+      return false;
+    }
+
+    // "Not profitable" means "did not clear the threshold", which is not the
+    // same as losing money - say which one it actually is.
+    const verdict =
+      netProfitUsd < 0
+        ? `at a net LOSS of $${Math.abs(netProfitUsd).toFixed(2)}`
+        : `for $${netProfitUsd.toFixed(2)}, below the $${config.minLiquidationRewardUsd} threshold`;
+    console.log(`   ⚠️  REQUIRE_PROFITABLE=false - liquidating anyway ${verdict}`);
+
+    if (netProfitUsd < 0) stats.unprofitableExecutions++;
   }
 
   if (config.dryRun) {
-    console.log(`🔍 DRY RUN - simulation passed and liquidation is profitable, not sending`);
+    console.log(`🔍 DRY RUN - simulation passed, would have sent this liquidation. Not sending.`);
     stats.skipped++;
     return false;
   }
@@ -256,10 +274,15 @@ export function logExecutionStats(): void {
   console.log(`   Failed:     ${stats.failed}`);
   console.log(`   Skipped:    ${stats.skipped}`);
 
+  if (stats.unprofitableExecutions > 0) {
+    console.log(`   At a loss:  ${stats.unprofitableExecutions} (REQUIRE_PROFITABLE=false)`);
+  }
+
   if (stats.successful > 0) {
+    const net = stats.totalRewardsUsd - stats.totalGasCostUsd;
     console.log(`   Rewards:    $${stats.totalRewardsUsd.toFixed(2)}`);
     console.log(`   Gas costs:  $${stats.totalGasCostUsd.toFixed(2)}`);
-    console.log(`   Net profit: $${(stats.totalRewardsUsd - stats.totalGasCostUsd).toFixed(2)}`);
+    console.log(`   Net ${net >= 0 ? 'profit' : 'LOSS  '}: $${net.toFixed(2)}`);
   }
   if (stats.lastLiquidationTime) {
     console.log(`   Last liquidation: ${stats.lastLiquidationTime.toISOString()}`);
