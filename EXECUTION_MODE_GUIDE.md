@@ -187,7 +187,7 @@ It is used **only** to convert gas into USD for the profitability comparison.
 | `MARKET_IDS` | *(all)* | Comma-separated allowlist |
 | `START_BLOCK` | `10797215` | Deploy block; only for the getLogs fallback replay |
 | `SUPABASE_URL` / `SUPABASE_KEY` | *(empty)* | Read positions from `canonical_pnl_events` |
-| `INDEXER_MAX_LAG_BLOCKS` | `25` | Use own getLogs when the indexer lags more |
+| `INDEXER_MAX_LAG_BLOCKS` | `40` | Use own getLogs when the indexer lags more |
 | `FUNDING_POKE_ENABLED` | `false` | Poke funding on idle markets only |
 | `FUNDING_POKE_STALE_SEC` | `86400` | Idle threshold and min gap between pokes |
 | `LIQ_BACKOFF_CYCLES` / `LIQ_BACKOFF_PRICE_BPS` | `10` / `50` | Retry backoff after a failed attempt |

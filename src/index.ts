@@ -29,7 +29,7 @@ Key environment variables (see .env.example):
   MARKET_REGISTRY_ADDRESS     MarketRegistry (defaults to the live deployment)
   MARKET_IDS                  Comma-separated market allowlist (default: all markets)
   SUPABASE_URL / SUPABASE_KEY Read positions from canonical_pnl_events (read-only)
-  INDEXER_MAX_LAG_BLOCKS      Fall back to on-chain getLogs when the indexer lags (default: 25)
+  INDEXER_MAX_LAG_BLOCKS      Fall back to on-chain getLogs when the indexer lags (default: 40)
   START_BLOCK                 First block for a getLogs replay (default: 10797215, the deploy block)
   EXECUTE_MODE                'true' to execute liquidations (default: monitor only)
   DRY_RUN                     'true' to simulate and price, but never send

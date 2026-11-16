@@ -30,7 +30,7 @@ Supabase (`canonical_pnl_events`), so the bot reads positions from there, read-o
   and is parsed back to the exact integer.
 - Each cycle it reads only rows with `cursor < block_number <= checkpoint`.
 - **Fallback:** if Supabase is not configured or errors, or the checkpoint in
-  `canonical_indexer_checkpoints` is more than `INDEXER_MAX_LAG_BLOCKS` (25) behind the
+  `canonical_indexer_checkpoints` is more than `INDEXER_MAX_LAG_BLOCKS` (40) behind the
   head, the bot reads `TradeExecuted` logs itself, incrementally from its last synced
   block. Without Supabase at startup it replays from `START_BLOCK` as before.
 

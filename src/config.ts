@@ -88,7 +88,7 @@ export const config = {
   supabaseKey: (process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || '').trim(),
   indexerName: (process.env.INDEXER_NAME || 'canonical-pnl-indexer').trim(),
   chainId: int('CHAIN_ID', 11155111),
-  indexerMaxLagBlocks: big('INDEXER_MAX_LAG_BLOCKS', 25n),
+  indexerMaxLagBlocks: big('INDEXER_MAX_LAG_BLOCKS', 40n),
   supabasePageSize: int('SUPABASE_PAGE_SIZE', 1000),
 
   // Market metadata (getMarket, marketRiskParams, band, vAMM fee) refresh period.
