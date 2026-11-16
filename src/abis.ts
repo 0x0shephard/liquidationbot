@@ -28,11 +28,16 @@ export const clearingHouseAbi = parseAbi([
   'error RiskParamsNotSet()',
   'error AmountZero()',
   'error ZeroAddress()',
+  'error LiquidationPriceOutOfBand(uint256 fillPriceX18, uint256 indexPriceX18)',
+  'error CuOracleAdapter_PriceStale()',
 
   'event TradeExecuted(address indexed user, bytes32 indexed marketId, int256 baseDelta, int256 quoteDelta, uint256 executionPrice, int256 newSize, uint256 newMargin, int256 realizedPnL, uint256 fee)',
   'function whitelistedLiquidators(address user) view returns (bool)',
   'function getPosition(address account, bytes32 marketId) view returns ((int256 size,uint256 margin,uint256 entryPriceX18,uint256 lastFundingPayIndex,uint256 lastFundingReceiveIndex,int256 realizedPnL))',
   'function isLiquidatable(address account, bytes32 marketId) view returns (bool)',
+  'function getMarginRatio(address account, bytes32 marketId) view returns (uint256)',
+  // Not present before the liquidation-band upgrade; callers must tolerate a revert.
+  'function liquidationPriceBandBps(bytes32 marketId) view returns (uint256)',
   'function liquidate(address account, bytes32 marketId, uint128 size, uint256 amountLimit)',
   'function marketRiskParams(bytes32 marketId) view returns (uint256 imrBps,uint256 mmrBps,uint256 liquidationPenaltyBps,uint256 penaltyCap,uint256 maxPositionSize,uint256 minPositionSize)',
 ]);
@@ -49,10 +54,17 @@ export const marketRegistryAbi = parseAbi([
 ]);
 
 export const oracleAbi = parseAbi([
+  'error CuOracleAdapter_PriceStale()',
   'function getPrice() view returns (uint256)',
 ]);
 
 export const vammAbi = parseAbi([
   'function getMarkPrice() view returns (uint256)',
+  'function getReserves() view returns (uint256 base, uint256 quote)',
+  'function feeBps() view returns (uint16)',
   'function pokeFunding() returns (uint256 longPay, uint256 longReceive, uint256 shortPay, uint256 shortReceive)',
+]);
+
+export const multicall3Abi = parseAbi([
+  'function getBlockNumber() view returns (uint256 blockNumber)',
 ]);

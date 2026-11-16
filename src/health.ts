@@ -4,6 +4,7 @@ import { getTrackerStats } from './tracker';
 import { getExecutionStats } from './executor';
 import { getMonitorState } from './monitor';
 import { getLiquidatorAddress } from './blockchain';
+import { getRpcStats } from './rpcStats';
 
 /**
  * Railway has no other way to tell a wedged bot from a healthy one - the process
@@ -33,8 +34,11 @@ export function startHealthServer(): void {
             liquidator: getLiquidatorAddress(),
             lastCycleAt: monitor.lastCycleAt ? new Date(monitor.lastCycleAt).toISOString() : null,
             lastSyncedBlock: monitor.lastSyncedBlock?.toString() ?? null,
+            head: monitor.head.toString(),
+            cycle: monitor.cycle,
             lastError: monitor.lastError,
             positions: tracker,
+            rpc: getRpcStats(),
             execution: config.executeMode ? getExecutionStats() : undefined,
           },
           null,

@@ -1,7 +1,8 @@
 import { formatEther } from 'viem';
 import { config, validateConfig } from './config';
 import { initializeTracker, trackSpecificAccount, getAllTrackedPositions, getTrackerStats } from './tracker';
-import { startMonitoring, stopMonitoring, logMarketStatus, markReady } from './monitor';
+import { startMonitoring, stopMonitoring, markReady } from './monitor';
+import { startRpcStatsLogger } from './rpcStats';
 import { startHealthServer } from './health';
 import { sendTestEmail } from './notifications';
 import {
@@ -27,25 +28,28 @@ Key environment variables (see .env.example):
   CLEARING_HOUSE_ADDRESS      ClearingHouse proxy (defaults to the live deployment)
   MARKET_REGISTRY_ADDRESS     MarketRegistry (defaults to the live deployment)
   MARKET_IDS                  Comma-separated market allowlist (default: all markets)
-  START_BLOCK                 First block to index (default: 10797215, the deploy block)
+  SUPABASE_URL / SUPABASE_KEY Read positions from canonical_pnl_events (read-only)
+  INDEXER_MAX_LAG_BLOCKS      Fall back to on-chain getLogs when the indexer lags (default: 25)
+  START_BLOCK                 First block for a getLogs replay (default: 10797215, the deploy block)
   EXECUTE_MODE                'true' to execute liquidations (default: monitor only)
   DRY_RUN                     'true' to simulate and price, but never send
   PRIVATE_KEY                 Liquidator key; must be whitelisted on-chain
   MIN_LIQUIDATION_REWARD_USD  Minimum net profit to execute (default: 10)
   MAX_GAS_PRICE_GWEI          Skip when gas exceeds this (default: 50)
   ETH_PRICE_USD               ETH price used to cost gas (default: 3000)
-  AMOUNT_LIMIT_MODE           'zero' (no slippage guard) or 'mark' (default: zero)
+  FUNDING_POKE_ENABLED        'true' to poke funding on idle markets (default: false)
 
-Positions are discovered from TradeExecuted logs, whose newSize field covers
-opens, resizes, closes and liquidations. Per-market vAMM, oracle and feeRouter
-addresses are resolved from the MarketRegistry at runtime.
+Positions come from Supabase canonical_pnl_events (or TradeExecuted logs as a
+fallback); newSize covers opens, resizes, closes and liquidations. Each cycle
+is one multicall of isLiquidatable/getMarginRatio per position plus index and
+vAMM reserves per market.
 `;
 
-async function preflight(): Promise<void> {
+async function preflight(): Promise<bigint> {
   const block = await getCurrentBlockNumber();
   console.log(`Connected to Sepolia at block ${block}`);
 
-  if (!config.executeMode) return;
+  if (!config.executeMode) return block;
 
   const liquidator = getLiquidatorAddress();
   if (!liquidator) throw new Error('EXECUTE_MODE is enabled but no wallet could be derived');
@@ -69,6 +73,7 @@ async function preflight(): Promise<void> {
   if (balance === 0n) {
     console.warn('⚠️  Liquidator wallet has no ETH - transactions will fail.');
   }
+  return block;
 }
 
 async function main(trackTarget?: { account: `0x${string}`; marketId: `0x${string}` }) {
@@ -87,7 +92,8 @@ async function main(trackTarget?: { account: `0x${string}`; marketId: `0x${strin
   startHealthServer();
 
   validateConfig();
-  await preflight();
+  startRpcStatsLogger(config.rpcStatsIntervalMs);
+  const head = await preflight();
 
   if (config.sendgridApiKey && config.alertRecipientEmail) {
     if (!(await sendTestEmail())) {
@@ -97,7 +103,7 @@ async function main(trackTarget?: { account: `0x${string}`; marketId: `0x${strin
     console.log('Email alerts not configured - logging to console only.');
   }
 
-  await initializeTracker();
+  await initializeTracker(head);
 
   if (trackTarget) {
     await trackSpecificAccount(trackTarget.account, trackTarget.marketId);
@@ -106,10 +112,9 @@ async function main(trackTarget?: { account: `0x${string}`; marketId: `0x${strin
   const stats = getTrackerStats();
   console.log(`\nTracking ${stats.total} position(s)`);
 
-  const markets = [...new Set(getAllTrackedPositions().map((p) => p.marketId))];
-  await logMarketStatus(markets);
+  console.log(`Markets with open interest: ${new Set(getAllTrackedPositions().map((p) => p.marketId)).size}`);
 
-  markReady(await getCurrentBlockNumber());
+  markReady(head);
   startMonitoring();
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {

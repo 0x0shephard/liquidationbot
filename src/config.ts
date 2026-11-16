@@ -39,7 +39,8 @@ export const config = {
   // runtime, so they are deliberately not configured here.
   marketIds: parseMarketIds(),
 
-  // Earliest Sepolia deployment receipt. Raise this to speed up bootstrap.
+  // Earliest Sepolia deployment receipt. Only used for a getLogs replay (no
+  // Supabase, or Supabase unreachable at startup). Raise it to speed that up.
   startBlock: big('START_BLOCK', 10_797_215n),
   logChunkSize: big('LOG_CHUNK_SIZE', 10_000n),
 
@@ -53,7 +54,9 @@ export const config = {
   // simulations run out of gas.
   gasLimit: big('GAS_LIMIT', 3_000_000n),
 
-  // liquidate() takes an amountLimit (slippage guard on the vAMM leg).
+  // liquidate() takes an amountLimit (slippage guard on the vAMM leg). When the
+  // ClearingHouse exposes liquidationPriceBandBps, amountLimit is always set to
+  // the band edge. These only apply on a deployment without the band:
   // 'zero' disables the guard; 'mark' derives it from the mark price.
   amountLimitMode: (process.env.AMOUNT_LIMIT_MODE || 'zero').trim().toLowerCase(),
   slippageBps: big('SLIPPAGE_BPS', 50n),
@@ -71,9 +74,38 @@ export const config = {
   // price has to come from outside.
   ethPriceUsd: float('ETH_PRICE_USD', 3000),
 
-  fundingPokeIntervalMs: int('FUNDING_POKE_INTERVAL_MS', 3_600_000),
+  // Funding accrues on every trade and liquidation, so routine pokes are wasted
+  // gas. Off by default; when on, only markets with open interest and no trade
+  // for FUNDING_POKE_STALE_SEC are poked, at most once per that window.
+  fundingPokeEnabled: process.env.FUNDING_POKE_ENABLED === 'true',
+  fundingPokeStaleSec: int('FUNDING_POKE_STALE_SEC', 86_400),
+
+  // Position source. When SUPABASE_URL + SUPABASE_KEY are set, open positions are
+  // rebuilt (read-only) from canonical_pnl_events written by canonical-indexer.
+  // If the indexer checkpoint lags the chain head by more than
+  // INDEXER_MAX_LAG_BLOCKS, the bot falls back to its own incremental getLogs.
+  supabaseUrl: (process.env.SUPABASE_URL || '').trim(),
+  supabaseKey: (process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || '').trim(),
+  indexerName: (process.env.INDEXER_NAME || 'canonical-pnl-indexer').trim(),
+  chainId: int('CHAIN_ID', 11155111),
+  indexerMaxLagBlocks: big('INDEXER_MAX_LAG_BLOCKS', 25n),
+  supabasePageSize: int('SUPABASE_PAGE_SIZE', 1000),
+
+  // Market metadata (getMarket, marketRiskParams, band, vAMM fee) refresh period.
+  marketCacheTtlMs: int('MARKET_CACHE_TTL_MS', 600_000),
+
+  // Failed / skipped liquidations are not retried until the index or mark price
+  // moves by more than LIQ_BACKOFF_PRICE_BPS, or LIQ_BACKOFF_CYCLES cycles pass.
+  liqBackoffCycles: int('LIQ_BACKOFF_CYCLES', 10),
+  liqBackoffPriceBps: big('LIQ_BACKOFF_PRICE_BPS', 50n),
+
+  // Calldata bytes per aggregate3 call. viem's default (1024) splits a 70-position
+  // scan into ~10 eth_calls. 16KB is ~120 positions per call, which keeps one
+  // eth_call well under the common 50M gas cap. 0 disables splitting.
+  multicallBatchBytes: int('MULTICALL_BATCH_BYTES', 16_384),
+
+  rpcStatsIntervalMs: int('RPC_STATS_INTERVAL_MS', 600_000),
   pollingIntervalMs: int('POLLING_INTERVAL_MS', 30_000),
-  maxPositionsPerScan: int('MAX_POSITIONS_PER_SCAN', 250),
 
   // RPC resilience
   rpcRetries: int('RPC_RETRIES', 5),
@@ -126,6 +158,13 @@ export function validateConfig(): void {
   } else {
     console.log('👁️  MONITORING MODE - Bot will only alert, not execute');
   }
+
+  if (config.supabaseUrl && config.supabaseKey) {
+    console.log(`Position source: Supabase canonical_pnl_events (fallback getLogs if indexer lags > ${config.indexerMaxLagBlocks} blocks)`);
+  } else {
+    console.log('Position source: on-chain TradeExecuted logs (SUPABASE_URL/SUPABASE_KEY not set)');
+  }
+  console.log(`Funding pokes: ${config.fundingPokeEnabled ? `enabled (stale after ${config.fundingPokeStaleSec}s)` : 'disabled'}`);
 
   if (config.marketIds.size > 0) {
     console.log(`Market filter: ${config.marketIds.size} market(s)`);
