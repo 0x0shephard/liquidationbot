@@ -1,155 +1,243 @@
+import { formatUnits } from 'viem';
 import { config } from './config';
 import {
-  calculateMarginHealth,
-  getPosition,
-  getMarket,
-  getOraclePrice,
-  getMarkPrice,
+  readCycleSnapshot,
+  refreshMarketMeta,
+  getCachedMarketMeta,
   isStaleOracleError,
+  errorMessage,
+  type CycleSnapshot,
+  type PositionRead,
 } from './blockchain';
 import {
   getAllTrackedPositions,
   updateTrackedPosition,
   removePosition,
-  syncNewEvents,
+  syncPositions,
   getTrackerStats,
+  getLastTradeBlock,
 } from './tracker';
 import { sendEmailAlert } from './notifications';
 import { executeLiquidationSafely, pokeFundingSafely, logExecutionStats } from './executor';
-import { HealthStatus, AlertData } from './types';
+import { HealthStatus, AlertData, MarginHealth, MarketMeta, MarketSnapshot, TrackedPosition } from './types';
 
-// Funding is poked per-market, since each market has its own vAMM.
-const lastFundingPokeByMarket = new Map<string, number>();
+const WAD = 10n ** 18n;
+const MAX_UINT = 2n ** 256n - 1n;
+const SEPOLIA_BLOCK_SEC = 12n;
+const MARKET_STATUS_EVERY_MS = 10 * 60_000;
 
 // Surfaced over the health endpoint so a stalled loop is externally visible.
 const state = {
   ready: false,
+  cycle: 0,
+  head: 0n,
   lastCycleAt: null as number | null,
   lastSyncedBlock: null as bigint | null,
   lastError: null as string | null,
+  lastMarketStatusAt: 0,
 };
+
+const staleMarkets = new Set<string>();
 
 export function getMonitorState() {
   return { ...state };
 }
 
-export function markReady(lastSyncedBlock: bigint): void {
+/** Called once after the tracker has loaded; `head` seeds the first cycle. */
+export function markReady(head: bigint): void {
   state.ready = true;
-  state.lastSyncedBlock = lastSyncedBlock;
+  state.head = head;
 }
 
-async function maybePokeFunding(marketIds: Set<string>): Promise<void> {
-  const now = Date.now();
+/**
+ * Health from the cycle multicall. isLiquidatable() is the sole authority for
+ * LIQUIDATABLE (it folds in pending funding and collateral valuation).
+ * WARNING uses getMarginRatio (effective margin / notional-at-mark, including
+ * funding) against IMR - approximate, alert-only.
+ */
+function buildHealth(
+  p: TrackedPosition,
+  read: PositionRead,
+  meta: MarketMeta,
+  snap: MarketSnapshot
+): MarginHealth {
+  const absSize = p.size < 0n ? -p.size : p.size;
+  const price = snap.markPriceX18 ?? snap.indexPriceX18 ?? 0n;
+  const notionalValue = (absSize * price) / WAD;
+  const initialMargin = (notionalValue * meta.risk.imrBps) / 10_000n;
+  const maintenanceMargin = (notionalValue * meta.risk.mmrBps) / 10_000n;
 
+  const ratio = read.marginRatioX18 !== null && read.marginRatioX18 !== MAX_UINT ? read.marginRatioX18 : null;
+  const effectiveMargin = ratio !== null ? (ratio * notionalValue) / WAD : 0n;
+
+  let status = HealthStatus.SAFE;
+  if (read.liquidatable) status = HealthStatus.LIQUIDATABLE;
+  else if (ratio !== null && ratio * 10_000n < meta.risk.imrBps * WAD) status = HealthStatus.WARNING;
+
+  return {
+    effectiveMargin,
+    maintenanceMargin,
+    initialMargin,
+    marginRatio: ratio !== null ? Number(formatUnits(ratio, 16)) : 0,
+    status,
+    unrealizedPnL: null,
+    notionalValue,
+    oraclePriceX18: snap.indexPriceX18 ?? 0n,
+  };
+}
+
+function logStaleTransitions(snapshot: CycleSnapshot): void {
+  for (const [marketId, error] of snapshot.marketErrors) {
+    if (staleMarkets.has(marketId)) continue;
+    staleMarkets.add(marketId);
+    const why = isStaleOracleError(error) ? 'stale oracle price' : errorMessage(error);
+    console.warn(`⏭️  Market ${marketId.slice(0, 10)}... index unreadable (${why}) - its positions are skipped until it recovers`);
+  }
+  for (const marketId of [...staleMarkets]) {
+    if (!snapshot.marketErrors.has(marketId)) {
+      staleMarkets.delete(marketId);
+      console.log(`✅ Market ${marketId.slice(0, 10)}... oracle readable again`);
+    }
+  }
+}
+
+function logMarketStatus(snapshot: CycleSnapshot): void {
+  if (snapshot.markets.size === 0) return;
+  console.log('--- Market status ---');
+  for (const [marketId, snap] of snapshot.markets) {
+    const meta = getCachedMarketMeta(marketId);
+    const mark = snap.markPriceX18 !== null ? Number(formatUnits(snap.markPriceX18, 18)) : NaN;
+    const band = meta?.bandBps === null ? 'none' : `${meta?.bandBps}bps`;
+    if (snap.indexPriceX18 === null) {
+      console.log(`${marketId.slice(0, 10)}...  oracle STALE  mark $${mark.toFixed(4)}  band ${band}`);
+      continue;
+    }
+    const index = Number(formatUnits(snap.indexPriceX18, 18));
+    const premium = index > 0 ? ((mark - index) / index) * 100 : 0;
+    console.log(
+      `${marketId.slice(0, 10)}...  oracle $${index.toFixed(4)}  mark $${mark.toFixed(4)}  premium ${premium.toFixed(3)}%  band ${band}${meta?.info.paused ? '  [PAUSED]' : ''}`
+    );
+  }
+  console.log('---------------------');
+}
+
+/**
+ * Funding accrues on every trade and liquidation, so pokes only matter for
+ * markets with open interest and no trade for FUNDING_POKE_STALE_SEC.
+ * pokeFundingSafely marks each attempt, so failures are not retried per cycle.
+ */
+async function maybePokeFunding(marketIds: string[], head: bigint): Promise<void> {
+  const staleBlocks = BigInt(config.fundingPokeStaleSec) / SEPOLIA_BLOCK_SEC;
   for (const marketId of marketIds) {
-    const last = lastFundingPokeByMarket.get(marketId) ?? 0;
-    if (now - last < config.fundingPokeIntervalMs) continue;
-
-    console.log(`\n⏰ Poking funding for ${marketId.slice(0, 10)}...`);
-    if (await pokeFundingSafely(marketId as `0x${string}`)) {
-      lastFundingPokeByMarket.set(marketId, now);
+    const lastTrade = getLastTradeBlock(marketId);
+    if (lastTrade === undefined || head - lastTrade < staleBlocks) continue;
+    const meta = getCachedMarketMeta(marketId);
+    if (!meta || meta.info.paused) continue;
+    if (await pokeFundingSafely(marketId as `0x${string}`, meta)) {
+      console.log(`⏰ Funding poked for idle market ${marketId.slice(0, 10)}... (no trade for ${head - lastTrade} blocks)`);
     }
   }
 }
 
 export async function monitorPositions(): Promise<void> {
-  state.lastSyncedBlock = await syncNewEvents();
+  state.cycle++;
+  state.lastSyncedBlock = await syncPositions(state.head);
 
   const positions = getAllTrackedPositions();
-  const stats = getTrackerStats();
+  const marketIds = [...new Set(positions.map((p) => p.marketId.toLowerCase()))];
+  if (marketIds.length > 0) await refreshMarketMeta(marketIds);
 
-  console.log(`\n[${new Date().toISOString()}] Checking ${positions.length} position(s)`);
-  console.log(`  ${stats.safe} safe, ${stats.warning} warning, ${stats.liquidatable} liquidatable`);
+  // Always run, even with no positions: it is also how the head is learned
+  // (Multicall3.getBlockNumber), which the getLogs fallback needs.
+  const snapshot = await readCycleSnapshot(positions, marketIds);
+  state.head = snapshot.blockNumber;
+  logStaleTransitions(snapshot);
 
-  if (positions.length === 0) {
-    console.log('No open positions');
-    state.lastCycleAt = Date.now();
-    return;
+  if (Date.now() - state.lastMarketStatusAt > MARKET_STATUS_EVERY_MS) {
+    state.lastMarketStatusAt = Date.now();
+    logMarketStatus(snapshot);
   }
 
-  if (config.executeMode) {
-    await maybePokeFunding(new Set(positions.map((p) => p.marketId)));
-  }
-
-  let scanned = 0;
-  const staleMarkets = new Set<string>();
+  const liquidatedMarkets = new Set<string>();
+  let readErrors = 0;
 
   for (const tracked of positions) {
-    if (scanned >= config.maxPositionsPerScan) {
-      console.log(`Reached MAX_POSITIONS_PER_SCAN (${config.maxPositionsPerScan}) - remaining positions next cycle`);
-      break;
+    const key = `${tracked.account.toLowerCase()}:${tracked.marketId.toLowerCase()}`;
+    const marketId = tracked.marketId.toLowerCase();
+    const read = snapshot.positions.get(key);
+    const meta = getCachedMarketMeta(marketId);
+    const snap = snapshot.markets.get(marketId);
+    if (!read || !meta || !snap) continue;
+
+    if (read.liquidatable === null) {
+      if (!staleMarkets.has(marketId)) readErrors++;
+      continue;
     }
-    scanned++;
+    // Closed on-chain, not yet reflected by the source.
+    if (read.marginRatioX18 === MAX_UINT) continue;
 
-    try {
-      const position = await getPosition(tracked.account, tracked.marketId);
+    const health = buildHealth(tracked, read, meta, snap);
+    const previousStatus = tracked.healthStatus;
+    updateTrackedPosition(tracked.account, tracked.marketId, { healthStatus: health.status, lastChecked: Date.now() });
 
-      // Closed or fully liquidated between our last sync and now.
-      if (position.size === 0n) {
-        removePosition(tracked.account, tracked.marketId);
+    const alert: AlertData = {
+      account: tracked.account,
+      marketId: tracked.marketId,
+      health,
+      position: { size: tracked.size },
+      timestamp: Date.now(),
+    };
+
+    if (health.status === HealthStatus.LIQUIDATABLE) {
+      if (!config.executeMode) {
+        if (previousStatus !== HealthStatus.LIQUIDATABLE) {
+          console.log(`🚨 LIQUIDATABLE: ${tracked.account.slice(0, 10)}... in ${marketId.slice(0, 10)}...`);
+        }
+        await sendEmailAlert(alert);
         continue;
       }
 
-      const health = await calculateMarginHealth(tracked.account, tracked.marketId, position);
-      const previousStatus = tracked.healthStatus;
+      // Reserves read this cycle are stale once we have traded in this market.
+      if (liquidatedMarkets.has(marketId)) continue;
 
-      updateTrackedPosition(tracked.account, tracked.marketId, {
-        size: position.size,
-        healthStatus: health.status,
-        lastChecked: Date.now(),
-      });
+      const outcome = await executeLiquidationSafely(tracked.account, tracked.marketId, tracked.size, meta, snap, state.cycle);
+      if (outcome.status === 'backoff') continue;
 
-      const alert: AlertData = {
-        account: tracked.account,
-        marketId: tracked.marketId,
-        health,
-        position,
-        timestamp: Date.now(),
-      };
-
-      if (health.status === HealthStatus.LIQUIDATABLE) {
-        console.log(`🚨 LIQUIDATABLE: ${tracked.account.slice(0, 10)}... in ${tracked.marketId.slice(0, 10)}...`);
-
-        if (config.executeMode) {
-          const liquidated = await executeLiquidationSafely(tracked.account, tracked.marketId);
-          if (liquidated) {
-            removePosition(tracked.account, tracked.marketId);
-            await sendEmailAlert({ ...alert, executionResult: 'success' });
-          } else {
-            await sendEmailAlert({ ...alert, executionResult: 'skipped' });
-          }
+      if (outcome.status === 'success') {
+        liquidatedMarkets.add(marketId);
+        if (outcome.full) {
+          removePosition(tracked.account, tracked.marketId);
         } else {
-          await sendEmailAlert(alert);
+          const remaining = tracked.size > 0n ? tracked.size - outcome.size : tracked.size + outcome.size;
+          updateTrackedPosition(tracked.account, tracked.marketId, { size: remaining });
         }
-      } else if (health.status === HealthStatus.WARNING) {
-        if (previousStatus !== HealthStatus.WARNING) {
-          console.log(`⚠️  WARNING: ${tracked.account.slice(0, 10)}... margin below IMR`);
-          await sendEmailAlert(alert);
-        }
-      } else if (previousStatus !== HealthStatus.SAFE) {
-        console.log(`✅ ${tracked.account.slice(0, 10)}... recovered to SAFE`);
+        await sendEmailAlert({ ...alert, executionResult: 'success' });
+      } else {
+        console.log(`   ↪ ${tracked.account.slice(0, 10)}... ${outcome.status}: ${outcome.reason}`);
+        await sendEmailAlert({ ...alert, executionResult: outcome.status === 'failed' ? 'failed' : 'skipped' });
       }
-    } catch (error: any) {
-      // A stale oracle makes every position in that market unreadable, so report
-      // it once per market per cycle instead of once per position.
-      if (isStaleOracleError(error)) {
-        if (!staleMarkets.has(tracked.marketId)) {
-          staleMarkets.add(tracked.marketId);
-          console.warn(
-            `⏭️  Market ${tracked.marketId.slice(0, 10)}... has a stale oracle price - skipping until it is refreshed`
-          );
-        }
-        continue;
+    } else if (health.status === HealthStatus.WARNING) {
+      if (previousStatus !== HealthStatus.WARNING) {
+        console.log(`⚠️  WARNING: ${tracked.account.slice(0, 10)}... margin below IMR`);
+        await sendEmailAlert(alert);
       }
-      console.error(`❌ Error checking ${tracked.account}: ${error.shortMessage || error.message}`);
+    } else if (previousStatus !== HealthStatus.SAFE) {
+      console.log(`✅ ${tracked.account.slice(0, 10)}... recovered to SAFE`);
     }
   }
 
-  if (staleMarkets.size > 0) {
-    console.warn(`⚠️  ${staleMarkets.size} market(s) skipped this cycle due to stale oracle prices.`);
+  if (readErrors > 0) console.warn(`⚠️  ${readErrors} position read(s) failed this cycle`);
+
+  if (config.executeMode && config.fundingPokeEnabled) {
+    await maybePokeFunding(marketIds, state.head);
   }
 
-  if (config.executeMode) logExecutionStats();
+  const stats = getTrackerStats();
+  console.log(
+    `[${new Date().toISOString()}] cycle ${state.cycle} block ${state.head} source=${stats.source} ` +
+      `positions=${stats.total} (${stats.safe} safe, ${stats.warning} warning, ${stats.liquidatable} liquidatable)`
+  );
+  if (config.executeMode && stats.liquidatable > 0) logExecutionStats();
 
   state.lastCycleAt = Date.now();
 }
@@ -164,10 +252,8 @@ export function startMonitoring(): void {
 
   console.log(`Starting monitor loop (every ${config.pollingIntervalMs}ms)`);
 
-  // A full scan can exceed the polling interval (many positions x several RPC
-  // calls each). Without this guard setInterval starts a second cycle on top of
-  // the first, and two cycles can both decide to liquidate the same position -
-  // the loser burns gas on a revert. Skip the tick instead of overlapping.
+  // Never overlap cycles: two cycles could both decide to liquidate the same
+  // position and the loser burns gas on a revert.
   let cycleInFlight = false;
 
   const runCycle = async () => {
@@ -181,8 +267,7 @@ export function startMonitoring(): void {
       await monitorPositions();
       state.lastError = null;
     } catch (error: any) {
-      // A cycle failure must not kill the loop - a transient RPC blip would
-      // otherwise take the bot down until Railway restarts it.
+      // A cycle failure must not kill the loop.
       state.lastError = error.shortMessage || error.message || String(error);
       console.error(`Cycle error: ${state.lastError}`);
     } finally {
@@ -200,36 +285,4 @@ export function stopMonitoring(): void {
     monitoringInterval = null;
     console.log('Monitoring stopped');
   }
-}
-
-/** Log oracle vs mark price for each market we currently have exposure to. */
-export async function logMarketStatus(marketIds: `0x${string}`[]): Promise<void> {
-  if (marketIds.length === 0) return;
-
-  console.log('\n--- Market status ---');
-  for (const marketId of marketIds) {
-    const label = `${marketId.slice(0, 10)}...`;
-    try {
-      const market = await getMarket(marketId);
-      const markPrice = await getMarkPrice(market.vamm);
-      const markNum = Number(markPrice) / 1e18;
-
-      let oracleNum: number;
-      try {
-        oracleNum = Number(await getOraclePrice(market.oracle)) / 1e18;
-      } catch (error: any) {
-        if (!isStaleOracleError(error)) throw error;
-        console.log(`${label}  oracle STALE          mark $${markNum.toFixed(4)}  (not liquidatable until refreshed)`);
-        continue;
-      }
-
-      const premium = oracleNum > 0 ? ((markNum - oracleNum) / oracleNum) * 100 : 0;
-      console.log(
-        `${label}  oracle $${oracleNum.toFixed(4)}  mark $${markNum.toFixed(4)}  premium ${premium.toFixed(3)}%${market.paused ? '  [PAUSED]' : ''}`
-      );
-    } catch (error: any) {
-      console.error(`${label}  error: ${error.shortMessage || error.message}`);
-    }
-  }
-  console.log('---------------------\n');
 }

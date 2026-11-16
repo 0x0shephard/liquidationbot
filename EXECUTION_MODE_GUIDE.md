@@ -124,14 +124,16 @@ Whitelisted: true
 
 ## What happens on each liquidation
 
-1. Re-read the position from chain. The tracker's size is a cache, and the contract
-   requires `0 < size <= currentSize` — a stale size reverts as `InvalidSize`.
-2. Re-check `isLiquidatable` and `isActive`. Another liquidator may have front-run
-   you, or the price may have recovered.
-3. Check gas price against `MAX_GAS_PRICE_GWEI`.
-4. **Simulate.** This catches reverts early and produces the gas estimate.
-5. Price it. Execute only if `reward - gasCost > MIN_LIQUIDATION_REWARD_USD`.
-6. Send, wait for the receipt, record the result.
+1. The cycle multicall reported `isLiquidatable == true`; size comes from the position
+   source (Supabase / TradeExecuted), not a fresh `getPosition`.
+2. Skip if this `(account, market)` is in backoff (failed recently and neither price
+   moved 0.5% nor 10 cycles passed).
+3. Size it inside `liquidationPriceBandBps` of the index (see README), respecting
+   `minPositionSize`; `amountLimit` = band-edge quote amount.
+4. Estimate fees; skip if `maxFeePerGas` is above `MAX_GAS_PRICE_GWEI`.
+5. **Simulate** with a single `eth_estimateGas` — catches reverts and produces the gas.
+6. Price it. Execute only if `reward - gasCost > MIN_LIQUIDATION_REWARD_USD`.
+7. Send with that gas and explicit `maxFeePerGas`, wait for the receipt.
 
 ---
 
@@ -183,11 +185,17 @@ It is used **only** to convert gas into USD for the profitability comparison.
 | `AMOUNT_LIMIT_MODE` | `zero` | `zero` = no slippage guard, `mark` = derive from mark price |
 | `SLIPPAGE_BPS` | `50` | Only used when mode is `mark` |
 | `MARKET_IDS` | *(all)* | Comma-separated allowlist |
-| `START_BLOCK` | `10797215` | Deploy block; raise to speed up bootstrap |
-| `FUNDING_POKE_INTERVAL_MS` | `3600000` | Per-market `pokeFunding` cadence |
+| `START_BLOCK` | `10797215` | Deploy block; only for the getLogs fallback replay |
+| `SUPABASE_URL` / `SUPABASE_KEY` | *(empty)* | Read positions from `canonical_pnl_events` |
+| `INDEXER_MAX_LAG_BLOCKS` | `40` | Use own getLogs when the indexer lags more |
+| `FUNDING_POKE_ENABLED` | `false` | Poke funding on idle markets only |
+| `FUNDING_POKE_STALE_SEC` | `86400` | Idle threshold and min gap between pokes |
+| `LIQ_BACKOFF_CYCLES` / `LIQ_BACKOFF_PRICE_BPS` | `10` / `50` | Retry backoff after a failed attempt |
 
 ### amountLimit
 
+When the ClearingHouse has `liquidationPriceBandBps`, `amountLimit` is always the
+band edge and these settings are ignored. On a pre-upgrade deployment:
 `liquidate` takes an `amountLimit` guarding the vAMM leg against slippage: a minimum
 quote-out when closing a long, a maximum quote-in when closing a short. `zero`
 disables the guard, which is the sane default — the position is already underwater and
@@ -222,6 +230,9 @@ To fix, refresh the feed using the price scripts in `bytestrikecontracts/script/
 | `NotLiquidatable` on simulate | Front-run, or the price recovered. A clean skip. |
 | `InvalidSize` | Position changed under you. The bot re-reads size, so this should be rare. |
 | `RemainingBelowMinLiquidateFull` | A partial liquidation would leave dust below `minPositionSize`. |
+| `LiquidationPriceOutOfBand` | vAMM too far from the index for the chosen size. The bot sizes inside the band, so this means the pool moved; it backs off. |
+| `MustLiquidateMore` | The largest in-band partial does not restore health. Backs off until prices move. |
+| `no size fills inside the price band` | Mark is already beyond the band. Nothing can be liquidated until mark and index converge. |
 | Everything logged as "not profitable" | Check `MIN_LIQUIDATION_REWARD_USD` against the ~500 reward ceiling. |
 | Zero positions found | Backfill never completed — almost always the RPC. |
 

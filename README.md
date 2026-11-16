@@ -19,11 +19,29 @@ default; set `MARKET_IDS` to restrict it.
 
 ## How it works
 
-**Position discovery.** The ClearingHouse has no way to enumerate positions, so the
-bot indexes `TradeExecuted` logs. That event carries the post-trade `newSize`, which
-means opens, resizes, closes *and* liquidations all collapse into one signal:
-`newSize == 0` means the account is flat. (`PositionOpened`/`PositionClosed` exist in
-older versions of the protocol but not in the deployed one.)
+**Position discovery.** The ClearingHouse has no way to enumerate positions. The
+shared `canonical-indexer` service already writes every ClearingHouse PnL event to
+Supabase (`canonical_pnl_events`), so the bot reads positions from there, read-only:
+
+- At startup it loads, for each `(user_address, market_id)`, the latest row with a
+  `new_size` (ordered by `block_number, transaction_index, primary_log_index`) up to
+  the indexer checkpoint, and keeps it if `new_size != 0`. A `close` row without
+  `new_size` means flat. `new_size` is the decimal string `formatUnits(newSize, 18)`
+  and is parsed back to the exact integer.
+- Each cycle it reads only rows with `cursor < block_number <= checkpoint`.
+- **Fallback:** if Supabase is not configured or errors, or the checkpoint in
+  `canonical_indexer_checkpoints` is more than `INDEXER_MAX_LAG_BLOCKS` (40) behind the
+  head, the bot reads `TradeExecuted` logs itself, incrementally from its last synced
+  block. Without Supabase at startup it replays from `START_BLOCK` as before.
+
+`TradeExecuted.newSize` (which is also what the indexer stores) covers opens,
+resizes, closes *and* liquidations in one signal: `0` means flat.
+
+**Monitoring.** Each 30s cycle is **one** `Multicall3.aggregate3` `eth_call`:
+`isLiquidatable` + `getMarginRatio` per position, `oracle.getPrice` +
+`vamm.getReserves` per market, and `Multicall3.getBlockNumber` for the head. There is
+no `getPosition` (size comes from the source). `getMarket`, `marketRiskParams`,
+`liquidationPriceBandBps` and `vAMM.feeBps` are cached for 10 minutes.
 
 **Health classification.** `isLiquidatable()` on-chain is the sole authority for
 `LIQUIDATABLE`. It folds in pending funding and real-time collateral valuation
@@ -33,12 +51,37 @@ approximate.
 
 **Liquidation.** `liquidate(account, marketId, size, amountLimit)`:
 
-1. Re-read the position from chain — the tracker's size is a cache, and the contract
-   requires `0 < size <= currentSize`.
-2. Re-check `isLiquidatable` and `isActive`.
-3. Simulate. This catches reverts early *and* yields the gas estimate.
-4. Price it: `reward - gasCost > MIN_LIQUIDATION_REWARD_USD`.
-5. Send, wait for the receipt, record the result.
+1. Size it inside the price band. The ClearingHouse reverts
+   `LiquidationPriceOutOfBand` if a closing long sells below `index * (1 - band)` or a
+   closing short buys above `index * (1 + band)` (`liquidationPriceBandBps`, default
+   500). Using the vAMM reserves and fee from this cycle's multicall, the bot
+   binary-searches the largest size whose constant-product fill stays inside the band
+   (exact integer mirror of `vAMM.sellBase`/`buyBase`). If that leaves less than
+   `minPositionSize`, it closes fully only if the full close is in band, else it takes
+   `size - minPositionSize`. `amountLimit` is the band-edge quote amount (min quote out
+   for a long, max quote in for a short), so a pool that moved reverts in the vAMM
+   instead of filling outside the band. If the ClearingHouse has no
+   `liquidationPriceBandBps` (pre-upgrade), it closes in full with the legacy
+   `AMOUNT_LIMIT_MODE`.
+2. One `eth_estimateGas` — the only pre-send execution. It simulates (custom errors
+   such as `LiquidationPriceOutOfBand`, `NotLiquidatable`, `MustLiquidateMore` and
+   stale oracle are decoded) and its result (+20%) is passed as `gas`.
+3. Price it: `reward - gasCost > MIN_LIQUIDATION_REWARD_USD`.
+4. Send with explicit `maxFeePerGas` (skipped if the estimate is above
+   `MAX_GAS_PRICE_GWEI`), wait for the receipt.
+
+Any non-success (revert, out of band, unprofitable, dry run) puts that
+`(account, market)` into backoff: it is not retried until the index or mark price
+moves more than 0.5% or 10 cycles pass.
+
+**Funding pokes** are off by default (`FUNDING_POKE_ENABLED=false`): funding accrues
+on every trade and liquidation. When enabled, only markets with open interest and no
+trade for `FUNDING_POKE_STALE_SEC` (24h) are poked, and an attempt is recorded even if
+it fails.
+
+**RPC accounting.** Every request goes through a counting transport; a `RPC_STATS`
+line (calls per method, per-day projection) is logged every 10 minutes and the totals
+are on the health endpoint.
 
 **Reward model** — mirrors the contract exactly, reading every input from chain:
 
@@ -62,9 +105,15 @@ npm run build
 npm start
 ```
 
-### An archive RPC is required
+### Supabase (recommended)
 
-Bootstrap replays `TradeExecuted` from the deployment block (10,797,215). Public
+Set `SUPABASE_URL` and `SUPABASE_KEY` (anon key is enough - the tables are publicly
+readable; the service-role key also works). The bot never writes to the database.
+`INDEXER_NAME` and `CHAIN_ID` must match the canonical-indexer's.
+
+### Without Supabase, an archive RPC is required
+
+The fallback replays `TradeExecuted` from the deployment block (10,797,215). Public
 endpoints reject historical `eth_getLogs` with *"Archive requests require a personal
 token"*. Use Alchemy/Infura, or raise `START_BLOCK` if you don't need older positions.
 
@@ -109,6 +158,7 @@ npm start                                # from build
 npm run dev -- --help
 npm run dev -- --test-email
 npm run dev -- --track <account> <marketId>
+npm test                                 # unit tests (node:test)
 ```
 
 ## Operational notes
@@ -123,12 +173,12 @@ keeps going. Nothing can be liquidated in a market whose oracle is stale, becaus
 **Gas pricing.** These are GPU compute perps. No market's mark price is a proxy for
 ETH, so `ETH_PRICE_USD` must be supplied to convert gas into USD.
 
-**Front-running.** Other liquidators compete. The bot re-checks liquidatability and
-simulates immediately before sending, so a lost race is a clean skip rather than a
-failed transaction.
+**Front-running.** Other liquidators compete. The bot simulates (estimateGas)
+immediately before sending, so a lost race is a clean skip rather than a failed
+transaction.
 
-**Persistence.** The position index is in-memory; a restart replays from `START_BLOCK`.
-For production, persist `(account, marketId, lastSyncedBlock)`.
+**Persistence.** The position index is in-memory and rebuilt from Supabase on restart
+(a few paged reads, no RPC). Only the getLogs fallback replays from `START_BLOCK`.
 
 ## Layout
 
@@ -137,12 +187,16 @@ src/
 ├── index.ts          # entry point, CLI, startup preflight (whitelist check)
 ├── config.ts         # env + live Sepolia defaults
 ├── abis.ts           # ABIs, matching bytestrikecontracts
-├── blockchain.ts     # chain reads/writes, RPC retry, margin health
-├── tracker.ts        # position index via TradeExecuted
-├── monitor.ts        # polling loop
-├── executor.ts       # profitability + liquidation execution
+├── blockchain.ts     # clients, cycle multicall, market cache, writes, RPC retry
+├── tracker.ts        # position index: Supabase canonical_pnl_events, getLogs fallback
+├── supabaseRows.ts   # new_size parsing + latest-row reconstruction (pure)
+├── bandMath.ts       # price-band liquidation sizing on x*y=k (pure)
+├── rpcStats.ts       # counting transport + RPC_STATS log
+├── monitor.ts        # polling loop, health, funding pokes
+├── executor.ts       # sizing, profitability, liquidation, backoff
 ├── notifications.ts  # SendGrid alerts
 └── types.ts
+test/                 # node:test unit tests
 ```
 
 ## License

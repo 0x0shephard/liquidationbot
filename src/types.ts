@@ -35,7 +35,7 @@ export interface MarketInfo {
 export interface TrackedPosition {
   account: `0x${string}`;
   marketId: `0x${string}`;
-  size: bigint; // last size seen in a TradeExecuted log; refreshed from chain before use
+  size: bigint; // latest newSize from canonical_pnl_events / TradeExecuted
   updatedBlock: bigint;
   lastChecked: number;
   healthStatus: HealthStatus;
@@ -53,7 +53,7 @@ export interface MarginHealth {
   initialMargin: bigint;
   marginRatio: number; // percentage
   status: HealthStatus;
-  unrealizedPnL: bigint;
+  unrealizedPnL: bigint | null; // null when not computed (size-only position source)
   notionalValue: bigint;
   oraclePriceX18: bigint;
 }
@@ -62,7 +62,25 @@ export interface AlertData {
   account: `0x${string}`;
   marketId: `0x${string}`;
   health: MarginHealth;
-  position: Position;
+  // Size is known from the position source; entry price only when read on-chain.
+  position: Pick<Position, 'size'> & Partial<Pick<Position, 'entryPriceX18'>>;
   timestamp: number;
   executionResult?: 'success' | 'failed' | 'skipped';
+}
+
+/** Market metadata refreshed every MARKET_CACHE_TTL_MS. */
+export interface MarketMeta {
+  info: MarketInfo;
+  risk: MarketRiskParams;
+  bandBps: bigint | null; // null => ClearingHouse has no liquidationPriceBandBps (pre-upgrade)
+  vammFeeBps: bigint | null; // vAMM.feeBps (swap fee on input); null if unreadable
+  fetchedAt: number;
+}
+
+/** Per-market live reads from the cycle multicall. null = read failed (e.g. stale oracle). */
+export interface MarketSnapshot {
+  indexPriceX18: bigint | null;
+  markPriceX18: bigint | null;
+  baseReserve: bigint | null;
+  quoteReserve: bigint | null;
 }

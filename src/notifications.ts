@@ -37,7 +37,7 @@ Effective Margin:    ${fmt(health.effectiveMargin)}
 Maintenance (MMR):   ${fmt(health.maintenanceMargin)}
 Initial (IMR):       ${fmt(health.initialMargin)}
 Notional Value:      ${fmt(health.notionalValue)}
-Unrealized PnL:      ${fmt(health.unrealizedPnL)}
+Unrealized PnL:      ${health.unrealizedPnL !== null ? fmt(health.unrealizedPnL) : 'n/a'}
 `;
 }
 
@@ -97,7 +97,7 @@ Time:     ${new Date(data.timestamp).toISOString()}
 Position
 --------
 Size:          ${fmt(absSize)} (${direction})
-Entry Price:   ${fmt(data.position.entryPriceX18)}
+Entry Price:   ${data.position.entryPriceX18 !== undefined ? fmt(data.position.entryPriceX18) : 'n/a'}
 Oracle Price:  ${fmt(data.health.oraclePriceX18)}
 ${formatHealth(data.health)}${guidance}${execution}
 ---
